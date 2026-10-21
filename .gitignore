@@ -1,0 +1,32 @@
+
+# Python - cache i pliki tymczasowe
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Środowisko wirtualne
+.venv/
+venv/
+env/
+
+# PyCharm
+.idea/
+
+# Pliki konfiguracyjne i sekrety
+.env
+.env.*
+!.env.example
+
+# Logi
+*.log
+
+# Testy i narzędzia
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# System operacyjny
+.DS_Store
+Thumbs.db
