@@ -116,6 +116,98 @@ def test_recorder_reports_missing_or_denied_microphone(monkeypatch):
         VoiceInputService().record(threading.Event())
 
 
+def test_wake_listener_uses_one_stream_and_waits_for_manual_stop(monkeypatch):
+    activated = threading.Event()
+    recording_started = threading.Event()
+    stop_recording = threading.Event()
+    stream_count = []
+    frame = np.full((4_000, 1), 5_000, dtype=np.int16)
+
+    class FakeStream:
+        def __init__(self, **kwargs):
+            self.callback = kwargs["callback"]
+            stream_count.append(True)
+
+        def __enter__(self):
+            self.callback(frame, len(frame), None, None)
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    fake_sounddevice = SimpleNamespace(
+        PortAudioError=type("FakePortAudioError", (Exception,), {}),
+        query_devices=lambda **_kwargs: None,
+        InputStream=FakeStream,
+    )
+    monkeypatch.setitem(sys.modules, "sounddevice", fake_sounddevice)
+
+    class Detector:
+        def detect(self, _chunk):
+            return True
+
+    result = []
+    errors = []
+
+    def run_session():
+        try:
+            result.append(
+                VoiceInputService().listen_for_wake_word_and_record(
+                    Detector(),
+                    threading.Event(),
+                    threading.Event(),
+                    stop_recording,
+                    activated.set,
+                    recording_started.set,
+                )
+            )
+        except Exception as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=run_session)
+    worker.start()
+    assert activated.wait(timeout=1)
+    assert recording_started.wait(timeout=1)
+    # Brak ciszy nie kończy nagrania: nadal działa ta sama sesja mikrofonu.
+    worker.join(timeout=0.2)
+    assert worker.is_alive()
+    assert len(stream_count) == 1
+
+    stop_recording.set()
+    worker.join(timeout=1)
+
+    assert not worker.is_alive()
+    assert errors == []
+    assert result[0].shape == (4_000,)
+
+
+def test_wake_listener_reports_microphone_error(monkeypatch):
+    class FakePortAudioError(Exception):
+        pass
+
+    def fail_query(**_kwargs):
+        raise FakePortAudioError("no microphone")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sounddevice",
+        SimpleNamespace(
+            PortAudioError=FakePortAudioError,
+            query_devices=fail_query,
+            InputStream=object,
+        ),
+    )
+    with pytest.raises(SpeechInputError, match="Nie można otworzyć mikrofonu"):
+        VoiceInputService().listen_for_wake_word_and_record(
+            object(),
+            threading.Event(),
+            threading.Event(),
+            threading.Event(),
+            lambda: None,
+            lambda: None,
+        )
+
+
 def test_piper_reports_missing_voice_without_loading_audio(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "piper", None)
     service = PiperSpeechService(tmp_path / "missing.onnx")

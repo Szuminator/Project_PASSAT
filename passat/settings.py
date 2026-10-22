@@ -23,6 +23,8 @@ class Settings:
     groq_model: str = DEFAULT_GROQ_MODEL
     stt_model: str = DEFAULT_STT_MODEL
     piper_model: str = DEFAULT_PIPER_MODEL
+    wake_word_enabled: bool = True
+    wake_word_model_path: str = "models/wake-word/vosk-model-small-pl-0.22"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -40,4 +42,11 @@ class Settings:
             or DEFAULT_STT_MODEL,
             piper_model=os.getenv("PASSAT_PIPER_MODEL", DEFAULT_PIPER_MODEL).strip()
             or DEFAULT_PIPER_MODEL,
+            wake_word_enabled=os.getenv("PASSAT_WAKE_WORD_ENABLED", "true").strip().lower()
+            not in {"0", "false", "no", "off"},
+            wake_word_model_path=os.getenv(
+                "PASSAT_WAKE_WORD_MODEL_PATH",
+                "models/wake-word/vosk-model-small-pl-0.22",
+            ).strip()
+            or "models/wake-word/vosk-model-small-pl-0.22",
         )

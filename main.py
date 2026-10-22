@@ -21,6 +21,8 @@ from core_widget import CoreWidget
 from passat.assistant import PassatAssistant
 from passat.audio.input import VoiceInputService, VoiceInputWorker
 from passat.audio.output import PiperSpeechService, SpeechOutputWorker
+from passat.audio.tts_text import prepare_tts_text
+from passat.audio.wake_word import WakeWordWorker
 from passat.models import AssistantReply
 from passat.providers.base import ProviderConfigurationError
 from passat.providers.factory import ProviderSelection, create_provider
@@ -79,8 +81,14 @@ class PassatWindow(QMainWindow):
         self._thread_pool = QThreadPool(self)
         self._active_worker: ReplyWorker | None = None
         self._voice_input_worker: VoiceInputWorker | None = None
+        self._wake_word_worker: WakeWordWorker | None = None
+        self._wake_engine = None
         self._speech_output_worker: SpeechOutputWorker | None = None
         self._voice_stop_event: threading.Event | None = None
+        self._wake_shutdown_event: threading.Event | None = None
+        self._wake_manual_record_event: threading.Event | None = None
+        self._wake_enabled = self.settings.wake_word_enabled
+        self._pending_speech_text: str | None = None
         self._speech_stop_event: threading.Event | None = None
         self._sending = False
         self._recording = False
@@ -175,6 +183,12 @@ class PassatWindow(QMainWindow):
         voice_controls.addWidget(self.stop_speech_button)
         layout.addLayout(voice_controls)
 
+        self.wake_word_button = QPushButton()
+        self.wake_word_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.wake_word_button.clicked.connect(self.toggle_wake_word)
+        layout.addWidget(self.wake_word_button, alignment=Qt.AlignmentFlag.AlignHCenter)
+        self._update_wake_word_button()
+
         self.chat = QPlainTextEdit()
         self.chat.setObjectName("chat")
         self.chat.setReadOnly(True)
@@ -219,6 +233,8 @@ class PassatWindow(QMainWindow):
             )
         if self.assistant.startup_notice:
             self.chat.appendPlainText(f"PASSAT: {self.assistant.startup_notice}")
+        if self._wake_enabled:
+            self._start_wake_word_listener()
 
     def set_status(self, status: str) -> None:
         """Aktualizuje etykietę statusu i barwy animowanego rdzenia."""
@@ -246,6 +262,8 @@ class PassatWindow(QMainWindow):
         message = self.message_input.text().strip()
         if not message:
             return
+
+        self._stop_wake_word_listener()
 
         self._sending = True
         self.chat.appendPlainText(f"TY: {message}")
@@ -276,7 +294,8 @@ class PassatWindow(QMainWindow):
             self.provider_label.setText(
                 f"{self.assistant.provider_name} · ostatnie żądanie zakończone powodzeniem"
             )
-        self._start_speaking(reply.text)
+        self._pending_speech_text = prepare_tts_text(reply.text)
+        self._start_pending_speech_when_ready()
 
     @Slot()
     def _on_worker_error(self) -> None:
@@ -298,6 +317,7 @@ class PassatWindow(QMainWindow):
         for button in self.status_buttons:
             button.setEnabled(True)
         self.message_input.setFocus()
+        self._start_wake_word_listener()
 
     @Slot()
     def toggle_recording(self) -> None:
@@ -308,10 +328,27 @@ class PassatWindow(QMainWindow):
             self.start_recording()
 
     def start_recording(self) -> None:
+        if self._wake_word_worker is not None:
+            if self._recording or self._sending or self._speaking:
+                return
+            self._wake_manual_record_event.set()
+            self._prepare_recording_ui()
+            return
         if self._voice_input_worker is not None:
             return
         self._recording = True
         self._voice_stop_event = threading.Event()
+        self._prepare_recording_ui()
+
+        worker = VoiceInputWorker(self.voice_input_service, self._voice_stop_event)
+        worker.signals.transcribed.connect(self._on_transcription)
+        worker.signals.failed.connect(self._on_voice_input_error)
+        worker.signals.finished.connect(self._on_voice_input_finished)
+        self._voice_input_worker = worker
+        self._thread_pool.start(worker)
+
+    def _prepare_recording_ui(self) -> None:
+        self._recording = True
         self.microphone_button.setText("ZATRZYMAJ NAGRYWANIE")
         self.message_input.setEnabled(False)
         self.send_button.setEnabled(False)
@@ -320,13 +357,6 @@ class PassatWindow(QMainWindow):
         for button in self.status_buttons:
             button.setEnabled(False)
         self.set_status("SŁUCHAM")
-
-        worker = VoiceInputWorker(self.voice_input_service, self._voice_stop_event)
-        worker.signals.transcribed.connect(self._on_transcription)
-        worker.signals.failed.connect(self._on_voice_input_error)
-        worker.signals.finished.connect(self._on_voice_input_finished)
-        self._voice_input_worker = worker
-        self._thread_pool.start(worker)
 
     @Slot()
     def stop_recording(self) -> None:
@@ -342,6 +372,130 @@ class PassatWindow(QMainWindow):
         self._recording = False
         self.message_input.setText(transcript)
         self.send_message()
+
+    @Slot(str)
+    def _on_wake_transcription(self, transcript: str) -> None:
+        if self._shutdown_waiting:
+            return
+        self._recording = False
+        self.chat.appendPlainText(f"TY: {transcript}")
+        self.message_input.setText(transcript)
+        self.send_message()
+
+    @Slot()
+    def _on_wake_activated(self) -> None:
+        if not self._shutdown_waiting:
+            self.chat.appendPlainText("PASSAT: Hasło aktywacyjne rozpoznane.")
+
+    @Slot()
+    def _on_wake_recording_started(self) -> None:
+        if self._shutdown_waiting:
+            return
+        if self._voice_stop_event is None:
+            self._voice_stop_event = threading.Event()
+        self._prepare_recording_ui()
+
+    @Slot(str)
+    def _on_wake_word_error(self, message: str) -> None:
+        self._wake_enabled = False
+        self._update_wake_word_button()
+        if not self._shutdown_waiting:
+            self.chat.appendPlainText(
+                f"INFORMACJA: Nasłuch hasła wyłączony: {message} "
+                "Nadal możesz używać przycisku mikrofonu i czatu."
+            )
+
+    @Slot()
+    def _on_wake_word_finished(self) -> None:
+        self._wake_word_worker = None
+        self._wake_shutdown_event = None
+        self._wake_manual_record_event = None
+        self._voice_stop_event = None
+        if self._sending or self._speaking or self._shutdown_waiting:
+            self._start_pending_speech_when_ready()
+            return
+        self._recording = False
+        self.microphone_button.setText("ROZPOCZNIJ MÓWIENIE")
+        self.microphone_button.setEnabled(True)
+        self.message_input.setEnabled(True)
+        self.send_button.setEnabled(True)
+        for button in self.status_buttons:
+            button.setEnabled(True)
+        self._start_pending_speech_when_ready()
+        if not self._wake_enabled:
+            self.set_status("OFFLINE" if self.assistant.is_offline else "GOTOWY")
+        self._start_wake_word_listener()
+
+    def toggle_wake_word(self) -> None:
+        """Włącza lub wyłącza lokalne oczekiwanie na hasło Passat."""
+        if self._wake_enabled:
+            if self._recording:
+                return
+            self._wake_enabled = False
+            self._stop_wake_word_listener()
+            if self._wake_word_worker is not None:
+                self.microphone_button.setEnabled(False)
+            self.wake_word_button.setText("WŁĄCZ NASŁUCH HASŁA")
+        else:
+            self._wake_enabled = True
+            self._update_wake_word_button()
+            self._start_wake_word_listener()
+
+    def _update_wake_word_button(self) -> None:
+        self.wake_word_button.setText(
+            "WYŁĄCZ NASŁUCH HASŁA" if self._wake_enabled else "WŁĄCZ NASŁUCH HASŁA"
+        )
+
+    def _start_wake_word_listener(self) -> None:
+        if (
+            not self._wake_enabled
+            or self._wake_word_worker is not None
+            or self._voice_input_worker is not None
+            or self._sending
+            or self._recording
+            or self._speaking
+            or self._shutdown_waiting
+        ):
+            return
+        self._wake_shutdown_event = threading.Event()
+        self._wake_manual_record_event = threading.Event()
+        self._voice_stop_event = threading.Event()
+        worker = WakeWordWorker(
+            self.voice_input_service,
+            self.settings.wake_word_model_path,
+            self._wake_shutdown_event,
+            self._wake_manual_record_event,
+            self._voice_stop_event,
+            engine=self._wake_engine,
+        )
+        worker.signals.engine_ready.connect(self._on_wake_engine_ready)
+        worker.signals.activated.connect(self._on_wake_activated)
+        worker.signals.recording_started.connect(self._on_wake_recording_started)
+        worker.signals.transcribed.connect(self._on_wake_transcription)
+        worker.signals.failed.connect(self._on_wake_word_error)
+        worker.signals.finished.connect(self._on_wake_word_finished)
+        self._wake_word_worker = worker
+        self.microphone_button.setText("NAGRAJ RĘCZNIE")
+        self._thread_pool.start(worker)
+
+    @Slot(object)
+    def _on_wake_engine_ready(self, engine: object) -> None:
+        self._wake_engine = engine
+
+    def _stop_wake_word_listener(self) -> None:
+        if self._wake_shutdown_event is not None:
+            self._wake_shutdown_event.set()
+
+    def _start_pending_speech_when_ready(self) -> None:
+        if self._pending_speech_text is None or self._wake_word_worker is not None:
+            return
+        text = self._pending_speech_text
+        self._pending_speech_text = None
+        if not text:
+            self.set_status("OFFLINE" if self._reply_is_offline else "GOTOWY")
+            self._finish_request()
+            return
+        self._start_speaking(text)
 
     @Slot(str)
     def _on_voice_input_error(self, message: str) -> None:
@@ -361,6 +515,7 @@ class PassatWindow(QMainWindow):
         for button in self.status_buttons:
             button.setEnabled(True)
         self.set_status("OFFLINE" if self.assistant.is_offline else "GOTOWY")
+        self._start_wake_word_listener()
 
     def _start_speaking(self, text: str) -> None:
         self._speaking = True
@@ -410,6 +565,7 @@ class PassatWindow(QMainWindow):
         self._shutdown_waiting = True
         if self._voice_stop_event is not None:
             self._voice_stop_event.set()
+        self._stop_wake_word_listener()
         if self._speech_stop_event is not None:
             self._speech_stop_event.set()
         if self._thread_pool.activeThreadCount() > 0:

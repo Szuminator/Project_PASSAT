@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import threading
-import time
+import queue
 from collections.abc import Callable
 
 from PySide6.QtCore import QObject, QRunnable, Signal, Slot
@@ -17,7 +17,6 @@ class VoiceInputService:
     """Nagrywa z domyślnego mikrofonu i leniwie wczytuje faster-whisper."""
 
     SAMPLE_RATE = 16_000
-    MAX_RECORDING_SECONDS = 90
     SILENCE_RMS_THRESHOLD = 0.004
 
     def __init__(self, model_name: str = "small"):
@@ -51,10 +50,8 @@ class VoiceInputService:
                 dtype="float32",
                 callback=capture,
             ):
-                started_at = time.monotonic()
                 while not stop_event.wait(0.1):
-                    if time.monotonic() - started_at >= self.MAX_RECORDING_SECONDS:
-                        break
+                    pass
         except sd.PortAudioError as error:
             raise SpeechInputError(
                 "Nie można otworzyć mikrofonu. Sprawdź, czy jest podłączony i czy "
@@ -73,6 +70,107 @@ class VoiceInputService:
             raise SpeechInputError("Nie wykryłem mowy. Sprawdź mikrofon i spróbuj ponownie.")
         if callback_error:
             raise SpeechInputError("Nagranie zostało przerwane przez problem z buforem audio.")
+        return audio
+
+    def listen_for_wake_word_and_record(
+        self,
+        detector,
+        shutdown_event: threading.Event,
+        manual_record_event: threading.Event,
+        stop_recording_event: threading.Event,
+        on_activated: Callable[[], None],
+        on_recording_started: Callable[[], None],
+    ) -> object | None:
+        """Nasłuchuje lokalnie, a po aktywacji nagrywa do ręcznego zatrzymania.
+
+        Jedno wejście audio obsługuje zarówno detekcję, jak i nagranie. Dzięki temu
+        mikrofon nie jest otwierany przez dwa niezależne procesy.
+        """
+        if shutdown_event.is_set():
+            return None
+        try:
+            import numpy as np
+            import sounddevice as sd
+        except ImportError as error:
+            raise SpeechInputError(
+                "Brakuje bibliotek audio. Zainstaluj zależności z requirements.txt."
+            ) from error
+
+        audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=8)
+        callback_errors: list[str] = []
+        chunks: list[bytes] = []
+        recording = False
+
+        def capture(indata, frames, time_info, status) -> None:
+            del frames, time_info
+            if status:
+                callback_errors.append(str(status))
+            try:
+                audio_queue.put_nowait(bytes(indata))
+            except queue.Full:
+                callback_errors.append("overflow")
+
+        try:
+            sd.query_devices(kind="input")
+            with sd.InputStream(
+                samplerate=self.SAMPLE_RATE,
+                channels=1,
+                dtype="int16",
+                blocksize=4_000,
+                callback=capture,
+            ):
+                while not shutdown_event.is_set():
+                    if callback_errors:
+                        raise SpeechInputError(
+                            "Nasłuch przerwano przez problem z buforem mikrofonu."
+                        )
+                    if not recording and manual_record_event.is_set():
+                        manual_record_event.clear()
+                        recording = True
+                        on_recording_started()
+
+                    try:
+                        frame = audio_queue.get(timeout=0.05)
+                    except queue.Empty:
+                        if recording and stop_recording_event.is_set():
+                            break
+                        continue
+
+                    if not recording and detector.detect(frame):
+                        recording = True
+                        on_activated()
+                        on_recording_started()
+                    if recording:
+                        chunks.append(frame)
+                        if stop_recording_event.is_set():
+                            break
+        except sd.PortAudioError as error:
+            raise SpeechInputError(
+                "Nie można otworzyć mikrofonu. Sprawdź, czy jest podłączony i czy "
+                "Passat ma dostęp do mikrofonu w ustawieniach Windows."
+            ) from error
+        except SpeechInputError:
+            raise
+        except Exception as error:
+            raise SpeechInputError(
+                "Wystąpił błąd podczas lokalnego nasłuchu hasła lub nagrywania."
+            ) from error
+
+        if shutdown_event.is_set() and not recording:
+            return None
+        if callback_errors:
+            raise SpeechInputError(
+                "Nagranie zostało przerwane przez problem z buforem audio."
+            )
+        if not chunks:
+            raise SpeechInputError("Nie zarejestrowano dźwięku. Spróbuj ponownie.")
+
+        audio = np.frombuffer(b"".join(chunks), dtype=np.int16).astype(np.float32) / 32768.0
+        if audio.size < self.SAMPLE_RATE // 4:
+            raise SpeechInputError("Nagranie jest za krótkie. Powiedz coś jeszcze raz.")
+        rms = float(np.sqrt(np.mean(np.square(audio))))
+        if rms < self.SILENCE_RMS_THRESHOLD:
+            raise SpeechInputError("Nie wykryłem mowy. Sprawdź mikrofon i spróbuj ponownie.")
         return audio
 
     def transcribe(self, audio: object) -> str:

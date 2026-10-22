@@ -224,3 +224,99 @@ def test_speaking_status_follows_playback_and_stop_restores_ready(qapp):
     assert window.core._audio_level == 0.0
     window.close()
     assert window._thread_pool.waitForDone(1000)
+
+
+def test_chat_keeps_markdown_but_piper_gets_prepared_text(qapp):
+    class MarkdownAssistant:
+        is_offline = False
+        provider_name = "GroqCloud"
+        startup_notice = None
+
+        def handle_message(self, _message):
+            return AssistantReply(
+                "# **Ważne**\n- Otwórz [dokument](https://example.com).\n"
+                "```python\nprint('sekret')\n```",
+                "GroqCloud",
+                False,
+            )
+
+    class CapturingSpeechService:
+        def __init__(self):
+            self.text = None
+
+        def speak(self, text, _stop_event, on_started, _on_audio_level):
+            self.text = text
+            on_started()
+            return False
+
+    speech = CapturingSpeechService()
+    window = PassatWindow(assistant=MarkdownAssistant())
+    window.speech_output_service = speech
+    window.show()
+    window.message_input.setText("test Markdown")
+    window.send_button.click()
+
+    for _ in range(100):
+        QTest.qWait(20)
+        if speech.text is not None and window.send_button.isEnabled():
+            break
+
+    visible = window.chat.toPlainText()
+    assert "# **Ważne**" in visible
+    assert "[dokument](https://example.com)" in visible
+    assert "print('sekret')" in visible
+    assert speech.text == "Ważne\nOtwórz dokument.\nPrzykład kodu pomijam."
+    window.close()
+    assert window._thread_pool.waitForDone(1000)
+
+
+def test_wake_listening_can_be_toggled_and_is_blocked_while_speaking(qapp, monkeypatch):
+    window = PassatWindow(assistant=BlockingAssistant())
+    window.show()
+    shutdown = Event()
+    window._wake_shutdown_event = shutdown
+    window._wake_enabled = True
+
+    window.toggle_wake_word()
+
+    assert not window._wake_enabled
+    assert shutdown.is_set()
+    assert window.wake_word_button.text() == "WŁĄCZ NASŁUCH HASŁA"
+
+    starts = []
+    monkeypatch.setattr(window, "_start_wake_word_listener", lambda: starts.append(True))
+    original_start_listener = PassatWindow._start_wake_word_listener
+    window.toggle_wake_word()
+    assert window._wake_enabled
+    assert starts == [True]
+
+    window._wake_word_worker = None
+    window._speaking = True
+    original_start_listener(window)
+    assert starts == [True]
+    window._speaking = False
+    window._wake_enabled = False
+    window.close()
+    assert window._thread_pool.waitForDone(1000)
+
+
+def test_missing_wake_model_keeps_manual_microphone_available(qapp, monkeypatch):
+    monkeypatch.setenv("PASSAT_WAKE_WORD_ENABLED", "true")
+    monkeypatch.setenv("PASSAT_WAKE_WORD_MODEL_PATH", "models/not-installed-yet")
+    window = PassatWindow(assistant=BlockingAssistant())
+    window.show()
+
+    for _ in range(100):
+        QTest.qWait(20)
+        if (
+            "Nasłuch hasła wyłączony" in window.chat.toPlainText()
+            and window._wake_word_worker is None
+        ):
+            break
+
+    assert "Nasłuch hasła wyłączony" in window.chat.toPlainText()
+    assert not window._wake_enabled
+    assert window.microphone_button.isEnabled()
+    assert window.microphone_button.text() == "ROZPOCZNIJ MÓWIENIE"
+    window.close()
+    assert window._thread_pool.waitForDone(1000)

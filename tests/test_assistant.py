@@ -30,6 +30,8 @@ def test_settings_come_from_environment(monkeypatch):
     monkeypatch.setenv("PASSAT_GROQ_MODEL", "qwen-test")
     monkeypatch.setenv("PASSAT_STT_MODEL", "base")
     monkeypatch.setenv("PASSAT_PIPER_MODEL", "voice/custom.onnx")
+    monkeypatch.setenv("PASSAT_WAKE_WORD_ENABLED", "true")
+    monkeypatch.setenv("PASSAT_WAKE_WORD_MODEL_PATH", "models/wake-test")
 
     settings = Settings.from_env()
 
@@ -40,6 +42,8 @@ def test_settings_come_from_environment(monkeypatch):
     assert settings.groq_model == "qwen-test"
     assert settings.stt_model == "base"
     assert settings.piper_model == "voice/custom.onnx"
+    assert settings.wake_word_enabled is True
+    assert settings.wake_word_model_path == "models/wake-test"
 
 
 def test_offline_provider_handles_identity_mode_greeting_and_unknown():

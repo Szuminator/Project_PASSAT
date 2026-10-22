@@ -3,9 +3,9 @@
 Passat to desktopowy asystent samochodowy w Pythonie i PySide6. Aplikacja ma
 animowany rdzeń, prosty czat, ograniczoną historię rozmowy i wymienne źródło
 odpowiedzi. Obecnie dostępne są GroqCloud, opcjonalne Gemini i podstawowy tryb
-offline. Mikrofon i lokalna synteza mowy są dostępne po instalacji zależności
-oraz pobraniu głosu Piper. Trwała pamięć, wyszukiwanie internetowe, GPS i
-integracja z samochodem nie są podłączone.
+offline. Mikrofon i lokalna synteza mowy działają po instalacji zależności,
+pobraniu głosu Piper oraz polskiego modelu Vosk dla nasłuchu hasła. Trwała
+pamięć, wyszukiwanie internetowe, GPS i integracja z samochodem nie są podłączone.
 
 ## Struktura
 
@@ -20,7 +20,9 @@ Project_PASSAT/
 │   ├── settings.py               # odczyt ustawień i .env
 │   ├── audio/
 │   │   ├── input.py              # mikrofon i faster-whisper
-│   │   └── output.py             # synteza Piper i odtwarzanie
+│   │   ├── output.py             # synteza Piper i odtwarzanie
+│   │   ├── tts_text.py           # przygotowanie tekstu tylko dla Piper
+│   │   └── wake_word.py          # wymienny detektor hasła i worker Qt
 │   └── providers/
 │       ├── base.py                # wspólny kontrakt i błędy dostawców
 │       ├── factory.py             # wybór dostawcy AI albo offline
@@ -162,7 +164,7 @@ językowy.
 
 ## Rozmowa głosowa (lokalna)
 
-Zależności `faster-whisper`, `sounddevice` i Piper są instalowane razem z
+Zależności `faster-whisper`, `sounddevice`, Vosk i Piper są instalowane razem z
 `requirements.txt`. Rozpoznawanie i synteza działają lokalnie. Przy pierwszym
 użyciu faster-whisper pobiera wybrany model do pamięci podręcznej Hugging Face;
 audio z mikrofonu nie jest wysyłane do tej usługi ani zapisywane na stałe.
@@ -185,13 +187,46 @@ PASSAT_STT_MODEL=small
 PASSAT_PIPER_MODEL=models/voices/pl_PL-gosia-medium.onnx
 ```
 
-Model Whisper ładuje się dopiero po naciśnięciu przycisku mikrofonu i działa na
-CPU w trybie `int8`. Pierwsze użycie wymaga internetu, aby pobrać model; kolejne
+Model Whisper ładuje się po pierwszej próbie transkrypcji i działa na CPU w
+trybie `int8`. Pierwsze użycie wymaga internetu, aby pobrać model; kolejne
 transkrypcje są lokalne. Wypowiedź można zakończyć przyciskiem **ZATRZYMAJ
-NAGRYWANIE**. Passat nie nasłuchuje w tle. Odpowiedzi są odczytywane po
-zakończeniu odpowiedzi AI; **PRZERWIJ MÓWIENIE** zatrzymuje aktualne odtwarzanie.
-Jeśli Piper lub głos nie są dostępne, tekstowa odpowiedź nadal pojawia się w
-czacie.
+NAGRYWANIE**. Odpowiedzi są odczytywane po zakończeniu odpowiedzi AI;
+**PRZERWIJ MÓWIENIE** zatrzymuje aktualne odtwarzanie. Jeśli Piper lub głos nie
+są dostępne, tekstowa odpowiedź nadal pojawia się w czacie.
+
+### Nasłuch hasła aktywacyjnego
+
+Nasłuch hasła **Passat** jest domyślnie włączony i działa lokalnie przez Vosk.
+Audio nie jest wysyłane do chmury ani zapisywane na dysku. Do detekcji i
+nagrywania używany jest jeden strumień mikrofonu. Po rozpoznaniu hasła Passat
+przechodzi do stanu **SŁUCHAM**; nagranie kończy się dopiero po naciśnięciu
+**ZATRZYMAJ NAGRYWANIE**. Nasłuch jest wstrzymany podczas myślenia i odtwarzania
+odpowiedzi, aby Passat nie aktywował się od własnego głosu.
+
+Biblioteka Vosk jest instalowana z `requirements.txt`, ale model językowy pobierz
+ręcznie z [oficjalnego katalogu modeli Vosk](https://alphacephei.com/vosk/models).
+Wybierz `vosk-model-small-pl-0.22` (około 50 MB, licencja Apache 2.0), rozpakuj
+folder do `models/wake-word/` i uruchom ponownie Passata. Ścieżka do folderu
+modelu musi odpowiadać ustawieniu `PASSAT_WAKE_WORD_MODEL_PATH`.
+Testy nie pobierają modelu. Model nie jest pobierany automatycznie przy starcie.
+
+Ustawienia w `.env`:
+
+```dotenv
+PASSAT_WAKE_WORD_ENABLED=true
+PASSAT_WAKE_WORD_MODEL_PATH=models/wake-word/vosk-model-small-pl-0.22
+```
+
+Przycisk **WYŁĄCZ NASŁUCH HASŁA** zatrzymuje oczekiwanie; można je później
+włączyć ponownie. Jeżeli brakuje modelu, biblioteki lub mikrofonu, nasłuch się
+wyłączy i pokaże informację. Nadal działa czat tekstowy oraz ręczny przycisk
+mikrofonu. Ponieważ Vosk jest rozpoznawaniem mowy z ograniczoną gramatyką, a nie
+dedykowanym modelem wake-word, warto sprawdzić liczbę fałszywych aktywacji na
+własnym mikrofonie i w typowym otoczeniu.
+
+Tekst w czacie zachowuje Markdown. Do Piper przekazywana jest oddzielnie
+przygotowana wersja: nie odczytuje znaczników formatowania, adresów URL ani
+surowego kodu/JSON.
 
 Nagranie i rozpoznawanie mogą zająć chwilę, zwłaszcza przy pierwszym pobraniu
 modelu. Interfejs pozostaje responsywny. Stan **MÓWIĘ** i deformacja pierścieni
