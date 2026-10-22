@@ -1,8 +1,9 @@
 """Punkt startowy Passata i widok rozmowy w PySide6."""
 
 import sys
+import threading
 
-from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, Signal, Slot
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, Signal, Slot
 from PySide6.QtWidgets import (
     QApplication,
     QHBoxLayout,
@@ -18,6 +19,8 @@ from PySide6.QtWidgets import (
 
 from core_widget import CoreWidget
 from passat.assistant import PassatAssistant
+from passat.audio.input import VoiceInputService, VoiceInputWorker
+from passat.audio.output import PiperSpeechService, SpeechOutputWorker
 from passat.models import AssistantReply
 from passat.providers.base import ProviderConfigurationError
 from passat.providers.factory import ProviderSelection, create_provider
@@ -70,9 +73,20 @@ class PassatWindow(QMainWindow):
     def __init__(self, assistant: PassatAssistant | None = None):
         super().__init__()
         self.assistant = assistant or create_assistant()
+        self.settings = Settings.from_env()
+        self.voice_input_service = VoiceInputService(self.settings.stt_model)
+        self.speech_output_service = PiperSpeechService(self.settings.piper_model)
         self._thread_pool = QThreadPool(self)
         self._active_worker: ReplyWorker | None = None
+        self._voice_input_worker: VoiceInputWorker | None = None
+        self._speech_output_worker: SpeechOutputWorker | None = None
+        self._voice_stop_event: threading.Event | None = None
+        self._speech_stop_event: threading.Event | None = None
         self._sending = False
+        self._recording = False
+        self._speaking = False
+        self._shutdown_waiting = False
+        self._reply_is_offline = self.assistant.is_offline
 
         self.setWindowTitle("PASSAT — osobisty asystent jazdy")
         self.resize(980, 900)
@@ -96,6 +110,9 @@ class PassatWindow(QMainWindow):
             QPushButton:disabled { color: #536174; border-color: #1a2636; }
             QPushButton#send { color: #06131d; background: #69dfff; border-color: #69dfff; }
             QPushButton#send:hover { background: #a1eeff; }
+            QPushButton#voice { color: #9fe9d6; border-color: #276b60; }
+            QPushButton#voice:hover { background: #14312e; border-color: #55c8aa; }
+            QPushButton#stop-speech { color: #ffc49e; border-color: #744735; }
             QPushButton#close { color: #f1a38c; border-color: #51342f; }
             QPushButton#close:hover { background: #321f21; border-color: #e57d5f; }
         """)
@@ -142,6 +159,21 @@ class PassatWindow(QMainWindow):
             self.status_buttons.append(button)
             buttons.addWidget(button)
         layout.addLayout(buttons)
+
+        voice_controls = QHBoxLayout()
+        self.microphone_button = QPushButton("ROZPOCZNIJ MÓWIENIE")
+        self.microphone_button.setObjectName("voice")
+        self.microphone_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.microphone_button.clicked.connect(self.toggle_recording)
+        voice_controls.addWidget(self.microphone_button)
+
+        self.stop_speech_button = QPushButton("PRZERWIJ MÓWIENIE")
+        self.stop_speech_button.setObjectName("stop-speech")
+        self.stop_speech_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.stop_speech_button.setEnabled(False)
+        self.stop_speech_button.clicked.connect(self.stop_speaking)
+        voice_controls.addWidget(self.stop_speech_button)
+        layout.addLayout(voice_controls)
 
         self.chat = QPlainTextEdit()
         self.chat.setObjectName("chat")
@@ -209,7 +241,7 @@ class PassatWindow(QMainWindow):
     @Slot()
     def send_message(self) -> None:
         """Dodaje wpis raz i zleca odpowiedź w puli wątków."""
-        if self._sending:
+        if self._sending or self._recording or self._speaking or self._shutdown_waiting:
             return
         message = self.message_input.text().strip()
         if not message:
@@ -222,6 +254,7 @@ class PassatWindow(QMainWindow):
         self.send_button.setEnabled(False)
         for button in self.status_buttons:
             button.setEnabled(False)
+        self.microphone_button.setEnabled(False)
         self.set_status("MYŚLĘ")
 
         worker = ReplyWorker(self.assistant, message)
@@ -236,15 +269,14 @@ class PassatWindow(QMainWindow):
         if reply.warning:
             self.chat.appendPlainText(f"INFORMACJA: {reply.warning}")
 
+        self._reply_is_offline = reply.is_offline
         if reply.is_offline:
             self.provider_label.setText("Dostawca: OFFLINE · odpowiedzi podstawowe")
-            self.set_status("OFFLINE")
         else:
             self.provider_label.setText(
                 f"{self.assistant.provider_name} · ostatnie żądanie zakończone powodzeniem"
             )
-            self.set_status("GOTOWY")
-        self._finish_request()
+        self._start_speaking(reply.text)
 
     @Slot()
     def _on_worker_error(self) -> None:
@@ -260,9 +292,134 @@ class PassatWindow(QMainWindow):
         self._active_worker = None
         self.message_input.setEnabled(True)
         self.send_button.setEnabled(True)
+        self.microphone_button.setEnabled(True)
+        self.microphone_button.setText("ROZPOCZNIJ MÓWIENIE")
+        self.stop_speech_button.setEnabled(False)
         for button in self.status_buttons:
             button.setEnabled(True)
         self.message_input.setFocus()
+
+    @Slot()
+    def toggle_recording(self) -> None:
+        """Rozpoczyna nagrywanie albo zatrzymuje bieżącą wypowiedź."""
+        if self._recording:
+            self.stop_recording()
+        elif not self._sending and not self._speaking and not self._shutdown_waiting:
+            self.start_recording()
+
+    def start_recording(self) -> None:
+        if self._voice_input_worker is not None:
+            return
+        self._recording = True
+        self._voice_stop_event = threading.Event()
+        self.microphone_button.setText("ZATRZYMAJ NAGRYWANIE")
+        self.message_input.setEnabled(False)
+        self.send_button.setEnabled(False)
+        self.microphone_button.setEnabled(True)
+        self.stop_speech_button.setEnabled(False)
+        for button in self.status_buttons:
+            button.setEnabled(False)
+        self.set_status("SŁUCHAM")
+
+        worker = VoiceInputWorker(self.voice_input_service, self._voice_stop_event)
+        worker.signals.transcribed.connect(self._on_transcription)
+        worker.signals.failed.connect(self._on_voice_input_error)
+        worker.signals.finished.connect(self._on_voice_input_finished)
+        self._voice_input_worker = worker
+        self._thread_pool.start(worker)
+
+    @Slot()
+    def stop_recording(self) -> None:
+        if self._voice_stop_event is not None:
+            self._voice_stop_event.set()
+        self._recording = False
+        self.microphone_button.setEnabled(False)
+
+    @Slot(str)
+    def _on_transcription(self, transcript: str) -> None:
+        if self._shutdown_waiting:
+            return
+        self._recording = False
+        self.message_input.setText(transcript)
+        self.send_message()
+
+    @Slot(str)
+    def _on_voice_input_error(self, message: str) -> None:
+        self.chat.appendPlainText(f"INFORMACJA: {message}")
+
+    @Slot()
+    def _on_voice_input_finished(self) -> None:
+        self._recording = False
+        self._voice_input_worker = None
+        self._voice_stop_event = None
+        if self._sending or self._shutdown_waiting:
+            return
+        self.microphone_button.setText("ROZPOCZNIJ MÓWIENIE")
+        self.microphone_button.setEnabled(True)
+        self.message_input.setEnabled(True)
+        self.send_button.setEnabled(True)
+        for button in self.status_buttons:
+            button.setEnabled(True)
+        self.set_status("OFFLINE" if self.assistant.is_offline else "GOTOWY")
+
+    def _start_speaking(self, text: str) -> None:
+        self._speaking = True
+        self._speech_stop_event = threading.Event()
+        self.stop_speech_button.setEnabled(True)
+        self.microphone_button.setEnabled(False)
+        for button in self.status_buttons:
+            button.setEnabled(False)
+        worker = SpeechOutputWorker(
+            self.speech_output_service,
+            text,
+            self._speech_stop_event,
+        )
+        worker.signals.started.connect(self._on_speech_started)
+        worker.signals.audio_level.connect(self.core.set_audio_level)
+        worker.signals.failed.connect(self._on_speech_error)
+        worker.signals.completed.connect(self._on_speech_finished)
+        self._speech_output_worker = worker
+        self._thread_pool.start(worker)
+
+    @Slot()
+    def _on_speech_started(self) -> None:
+        if not self._shutdown_waiting:
+            self.set_status("MÓWIĘ")
+
+    @Slot(str)
+    def _on_speech_error(self, message: str) -> None:
+        self.chat.appendPlainText(f"INFORMACJA: {message} Odpowiedź tekstowa pozostaje dostępna.")
+
+    @Slot(bool)
+    def _on_speech_finished(self, interrupted: bool) -> None:
+        del interrupted
+        self._speaking = False
+        self._speech_output_worker = None
+        self._speech_stop_event = None
+        self.core.set_audio_level(0.0)
+        self.set_status("OFFLINE" if self._reply_is_offline else "GOTOWY")
+        self._finish_request()
+
+    @Slot()
+    def stop_speaking(self) -> None:
+        if self._speech_stop_event is not None:
+            self._speech_stop_event.set()
+
+    def closeEvent(self, event) -> None:
+        """Kończy audio i czeka asynchronicznie na aktywne zadania robocze."""
+        self._shutdown_waiting = True
+        if self._voice_stop_event is not None:
+            self._voice_stop_event.set()
+        if self._speech_stop_event is not None:
+            self._speech_stop_event.set()
+        if self._thread_pool.activeThreadCount() > 0:
+            event.ignore()
+            self.setWindowTitle("PASSAT — zamykanie…")
+            self.setEnabled(False)
+            QTimer.singleShot(100, self.close)
+            return
+        self.core.stop_animation()
+        event.accept()
 
 
 def main() -> int:

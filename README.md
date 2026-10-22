@@ -3,8 +3,9 @@
 Passat to desktopowy asystent samochodowy w Pythonie i PySide6. Aplikacja ma
 animowany rdzeń, prosty czat, ograniczoną historię rozmowy i wymienne źródło
 odpowiedzi. Obecnie dostępne są GroqCloud, opcjonalne Gemini i podstawowy tryb
-offline. Mikrofon, trwała pamięć, wyszukiwanie internetowe, GPS i integracja z
-samochodem nie są podłączone.
+offline. Mikrofon i lokalna synteza mowy są dostępne po instalacji zależności
+oraz pobraniu głosu Piper. Trwała pamięć, wyszukiwanie internetowe, GPS i
+integracja z samochodem nie są podłączone.
 
 ## Struktura
 
@@ -17,6 +18,9 @@ Project_PASSAT/
 │   ├── models.py                 # wspólne typy wiadomości i odpowiedzi
 │   ├── prompts.py                # instrukcja osobowości
 │   ├── settings.py               # odczyt ustawień i .env
+│   ├── audio/
+│   │   ├── input.py              # mikrofon i faster-whisper
+│   │   └── output.py             # synteza Piper i odtwarzanie
 │   └── providers/
 │       ├── base.py                # wspólny kontrakt i błędy dostawców
 │       ├── factory.py             # wybór dostawcy AI albo offline
@@ -156,6 +160,49 @@ offline rozpoznaje powitania, pytania o tożsamość Passata i tryb działania;
 potrafi też podać lokalną godzinę. Pozostałych odpowiedzi nie generuje model
 językowy.
 
+## Rozmowa głosowa (lokalna)
+
+Zależności `faster-whisper`, `sounddevice` i Piper są instalowane razem z
+`requirements.txt`. Rozpoznawanie i synteza działają lokalnie. Przy pierwszym
+użyciu faster-whisper pobiera wybrany model do pamięci podręcznej Hugging Face;
+audio z mikrofonu nie jest wysyłane do tej usługi ani zapisywane na stałe.
+
+Pobierz polski głos Piper raz, gdy komputer ma dostęp do internetu:
+
+```powershell
+.\.venv\Scripts\python.exe -m piper.download_voices pl_PL-gosia-medium --download-dir models/voices
+```
+
+Piper potrzebuje osobnych plików `pl_PL-gosia-medium.onnx` i
+`pl_PL-gosia-medium.onnx.json`. Model ma około 63 MB i jest ignorowany przez Git.
+Karta głosu opisuje zbiór danych jako CC0; przed dalszą dystrybucją głosu
+sprawdź bieżącą kartę modelu. Sam silnik Piper ma licencję GPL-3.0.
+
+W `.env` możesz zmienić konfigurację:
+
+```dotenv
+PASSAT_STT_MODEL=small
+PASSAT_PIPER_MODEL=models/voices/pl_PL-gosia-medium.onnx
+```
+
+Model Whisper ładuje się dopiero po naciśnięciu przycisku mikrofonu i działa na
+CPU w trybie `int8`. Pierwsze użycie wymaga internetu, aby pobrać model; kolejne
+transkrypcje są lokalne. Wypowiedź można zakończyć przyciskiem **ZATRZYMAJ
+NAGRYWANIE**. Passat nie nasłuchuje w tle. Odpowiedzi są odczytywane po
+zakończeniu odpowiedzi AI; **PRZERWIJ MÓWIENIE** zatrzymuje aktualne odtwarzanie.
+Jeśli Piper lub głos nie są dostępne, tekstowa odpowiedź nadal pojawia się w
+czacie.
+
+Nagranie i rozpoznawanie mogą zająć chwilę, zwłaszcza przy pierwszym pobraniu
+modelu. Interfejs pozostaje responsywny. Stan **MÓWIĘ** i deformacja pierścieni
+otrzymują wygładzony poziom RMS z rzeczywiście odtwarzanego dźwięku.
+
+Przy przenoszeniu na Raspberry Pi 5 trzeba będzie sprawdzić koła dla konkretnego
+systemu ARM64 i wydajność wybranego modelu. Na Linuksie `sounddevice` może wymagać
+systemowego PortAudio, np. pakietu `libportaudio2`; dobór urządzenia audio może
+też zależeć od ALSA/PipeWire. Implementacja jest oddzielona od interfejsu tak,
+aby te ustawienia można było dostroić bez przebudowy czatu.
+
 ## Rozwiązywanie problemów
 
 - **Passat działa offline:** sprawdź, czy `.env` znajduje się obok `main.py`,
@@ -167,6 +214,16 @@ językowy.
   `Retry-After` i nie wykonuje nieograniczonych ponowień.
 - **Model niedostępny:** wybierz model dostępny dla projektu i ustaw go w
   `PASSAT_GROQ_MODEL` albo `PASSAT_GEMINI_MODEL`.
+- **Mikrofon nie działa:** sprawdź uprawnienia mikrofonu w ustawieniach
+  prywatności Windows, wybór domyślnego urządzenia wejściowego oraz czy inna
+  aplikacja go nie blokuje. Listę urządzeń sprawdzisz poleceniem:
+
+  ```powershell
+  .\.venv\Scripts\python.exe -c "import sounddevice as sd; print(sd.query_devices())"
+  ```
+
+- **Brak głosu:** pobierz model Piper poleceniem z sekcji „Rozmowa głosowa” i
+  sprawdź `PASSAT_PIPER_MODEL`.
 - **Zależności:** uruchom `python -m pip install -r requirements-dev.txt`
   w aktywnym środowisku `.venv`. Bez aktywacji:
 

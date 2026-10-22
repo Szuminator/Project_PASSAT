@@ -28,6 +28,8 @@ def test_settings_come_from_environment(monkeypatch):
     monkeypatch.setenv("PASSAT_GEMINI_MODEL", "gemini-test")
     monkeypatch.setenv("GROQ_API_KEY", "groq-example-only")
     monkeypatch.setenv("PASSAT_GROQ_MODEL", "qwen-test")
+    monkeypatch.setenv("PASSAT_STT_MODEL", "base")
+    monkeypatch.setenv("PASSAT_PIPER_MODEL", "voice/custom.onnx")
 
     settings = Settings.from_env()
 
@@ -36,6 +38,8 @@ def test_settings_come_from_environment(monkeypatch):
     assert settings.gemini_model == "gemini-test"
     assert settings.groq_api_key == "groq-example-only"
     assert settings.groq_model == "qwen-test"
+    assert settings.stt_model == "base"
+    assert settings.piper_model == "voice/custom.onnx"
 
 
 def test_offline_provider_handles_identity_mode_greeting_and_unknown():

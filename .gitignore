@@ -19,6 +19,11 @@ env/
 
 # Logi
 *.log
+*.wav
+
+# Lokalne modele głosowe i modele AI (nie dodawaj dużych binariów do Git)
+models/
+audio-recordings/
 
 # Testy i narzędzia
 .pytest_cache/

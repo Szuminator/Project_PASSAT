@@ -14,6 +14,8 @@ class CoreWidget(QWidget):
         super().__init__(parent)
         self._phase = 0.0
         self._status = "GOTOWY"
+        self._audio_level = 0.0
+        self._display_audio_level = 0.0
         self._primary = QColor("#69dfff")
         self._secondary = QColor("#ff9a57")
         self.setMinimumSize(300, 300)
@@ -31,8 +33,17 @@ class CoreWidget(QWidget):
         self._secondary = QColor(secondary)
         self.update()
 
+    def set_audio_level(self, level: float) -> None:
+        """Przyjmuje znormalizowany poziom odtwarzanego dźwięku z zakresu 0–1."""
+        self._audio_level = max(0.0, min(1.0, float(level)))
+
+    def stop_animation(self) -> None:
+        """Zatrzymuje timer animacji podczas zamykania okna."""
+        self._timer.stop()
+
     def _advance(self) -> None:
         self._phase = (self._phase + 0.025) % (2 * math.pi)
+        self._display_audio_level += (self._audio_level - self._display_audio_level) * 0.24
         self.update()
 
     def paintEvent(self, event):
@@ -43,7 +54,7 @@ class CoreWidget(QWidget):
         cx, cy = float(center.x()), float(center.y())
         radius = min(self.width(), self.height()) * 0.34
         speaking = self._status == "MÓWIĘ"
-        pulse_amount = 0.10 if speaking else 0.035
+        pulse_amount = (0.06 + self._display_audio_level * 0.12) if speaking else 0.035
         pulse_speed = 2.4 if speaking else 1.5
         pulse = 1.0 + pulse_amount * math.sin(self._phase * pulse_speed)
 
@@ -67,7 +78,7 @@ class CoreWidget(QWidget):
             painter.setBrush(Qt.BrushStyle.NoBrush)
             if speaking:
                 path = QPainterPath()
-                wave_size = radius * 0.045
+                wave_size = radius * (0.025 + self._display_audio_level * 0.10)
                 point_count = 240
                 for point_index in range(point_count + 1):
                     angle_on_ring = 2 * math.pi * point_index / point_count
