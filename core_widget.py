@@ -3,7 +3,7 @@
 import math
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QColor, QPainter, QPen, QRadialGradient
+from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QRadialGradient
 from PySide6.QtWidgets import QWidget
 
 
@@ -13,6 +13,7 @@ class CoreWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._phase = 0.0
+        self._status = "GOTOWY"
         self._primary = QColor("#69dfff")
         self._secondary = QColor("#ff9a57")
         self.setMinimumSize(300, 300)
@@ -25,6 +26,7 @@ class CoreWidget(QWidget):
 
     def set_status(self, status: str, primary: str, secondary: str) -> None:
         """Zmienia barwy rdzenia zależnie od stanu asystenta."""
+        self._status = status
         self._primary = QColor(primary)
         self._secondary = QColor(secondary)
         self.update()
@@ -40,7 +42,10 @@ class CoreWidget(QWidget):
         center = self.rect().center()
         cx, cy = float(center.x()), float(center.y())
         radius = min(self.width(), self.height()) * 0.34
-        pulse = 1.0 + 0.035 * math.sin(self._phase * 1.5)
+        speaking = self._status == "MÓWIĘ"
+        pulse_amount = 0.10 if speaking else 0.035
+        pulse_speed = 2.4 if speaking else 1.5
+        pulse = 1.0 + pulse_amount * math.sin(self._phase * pulse_speed)
 
         # Miękka poświata za rdzeniem.
         glow = QRadialGradient(cx, cy, radius * 1.55)
@@ -51,7 +56,7 @@ class CoreWidget(QWidget):
         painter.setBrush(glow)
         painter.drawEllipse(center, int(radius * 1.55), int(radius * 1.55))
 
-        # Trzy cienkie, pulsujące orbity z ruchomymi punktami.
+        # Trzy cienkie orbity. W stanie MÓWIĘ ich kształt faluje jak wizualizacja głosu.
         for index, factor in enumerate((0.74, 1.0, 1.27)):
             ring_radius = radius * factor * pulse
             color = self._primary if index != 1 else self._secondary
@@ -60,7 +65,26 @@ class CoreWidget(QWidget):
             pen = QPen(color, 1.4 if index == 1 else 1.0)
             painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawEllipse(center, int(ring_radius), int(ring_radius))
+            if speaking:
+                path = QPainterPath()
+                wave_size = radius * 0.045
+                point_count = 240
+                for point_index in range(point_count + 1):
+                    angle_on_ring = 2 * math.pi * point_index / point_count
+                    wave = wave_size * math.sin(
+                        5 * angle_on_ring + self._phase * 3.2 + index * 1.1
+                    )
+                    point_radius = ring_radius + wave
+                    x = cx + math.cos(angle_on_ring) * point_radius
+                    y = cy + math.sin(angle_on_ring) * point_radius
+                    if point_index == 0:
+                        path.moveTo(x, y)
+                    else:
+                        path.lineTo(x, y)
+                path.closeSubpath()
+                painter.drawPath(path)
+            else:
+                painter.drawEllipse(center, int(ring_radius), int(ring_radius))
 
             angle = self._phase * (1.0 if index % 2 == 0 else -0.72) + index * 1.9
             dot_x = cx + math.cos(angle) * ring_radius
@@ -79,10 +103,3 @@ class CoreWidget(QWidget):
         painter.setPen(QPen(QColor(190, 243, 255, 180), 1.2))
         painter.setBrush(sphere)
         painter.drawEllipse(center, int(core_radius), int(core_radius))
-
-        # Mały ciepły blik podkreśla pomarańczową część rdzenia.
-        accent = QColor(self._secondary)
-        accent.setAlpha(150)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(accent)
-        painter.drawEllipse(int(cx + core_radius * 0.28), int(cy + core_radius * 0.15), 7, 7)
