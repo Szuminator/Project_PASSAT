@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest>=8.0,<10.0
+# Testy opcjonalnego adaptera Gemini; nie jest potrzebne do uruchomienia aplikacji.
+google-genai>=2.30,<3.0

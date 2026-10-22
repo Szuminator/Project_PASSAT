@@ -1,0 +1,1 @@
+"""Moduły aplikacji Passat."""
