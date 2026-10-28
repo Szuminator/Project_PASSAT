@@ -1,11 +1,15 @@
 import threading
+from datetime import datetime
 from threading import Event
+from types import SimpleNamespace
 
 from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
 
 from main import PassatWindow
+from passat.assistant import PassatAssistant
 from passat.models import AssistantReply
+from passat.providers.factory import ProviderSelection
 
 
 class ImmediateSpeechService:
@@ -274,6 +278,145 @@ def test_wake_listener_resumes_only_after_piper_finishes(qapp, monkeypatch):
 
     assert wake_starts == [True]
     window._wake_enabled = False
+    window.close()
+    assert window._thread_pool.waitForDone(1000)
+
+
+def test_local_rule_reply_is_not_reported_as_a_provider_call(qapp):
+    class LocalRuleAssistant:
+        is_offline = False
+        startup_notice = None
+        provider_name = "GroqCloud"
+
+        def handle_message(self, _message):
+            return AssistantReply(
+                "Nie znam dokładnego adresu tego miejsca.",
+                "reguła lokalna",
+                False,
+                is_local_rule=True,
+            )
+
+    window = PassatWindow(assistant=LocalRuleAssistant())
+    window.speech_output_service = ImmediateSpeechService()
+    window.show()
+    window.message_input.setText("wyznacz trasę do celu")
+    window.send_button.click()
+
+    for _ in range(100):
+        QTest.qWait(20)
+        if window.send_button.isEnabled():
+            break
+
+    assert "PASSAT (reguła lokalna): Nie znam dokładnego adresu tego miejsca." in (
+        window.chat.toPlainText()
+    )
+    assert window.provider_label.text() == "Odpowiedź lokalna · bez wywołania modelu"
+    assert window.status_label.text().endswith("GOTOWY")
+    window.close()
+    assert window._thread_pool.waitForDone(1000)
+
+
+def test_whisper_time_transcript_uses_local_clock_without_provider(qapp):
+    class ProviderSpy:
+        name = "test-provider"
+
+        def __init__(self):
+            self.calls = []
+
+        def generate_reply(self, message, _history, _system_instruction):
+            self.calls.append(message)
+            return "To nie powinno się pojawić."
+
+    provider = ProviderSpy()
+    assistant = PassatAssistant(ProviderSelection(provider, "test-provider", False))
+    window = PassatWindow(assistant=assistant)
+    window.speech_output_service = ImmediateSpeechService()
+    window.show()
+
+    window._on_transcription("Passat, która teraz jest godzina?")
+    for _ in range(100):
+        QTest.qWait(20)
+        if window.send_button.isEnabled() and "PASSAT (offline): Jest teraz " in window.chat.toPlainText():
+            break
+
+    assert "PASSAT (offline): Jest teraz " in window.chat.toPlainText()
+    assert provider.calls == []
+    window.close()
+    assert window._thread_pool.waitForDone(1000)
+
+
+def test_whisper_date_transcript_uses_system_date_without_provider(qapp, monkeypatch):
+    local_timezone = datetime.now().astimezone().tzinfo
+    fixed_now = datetime(2026, 10, 28, 12, 0, tzinfo=local_timezone)
+    monkeypatch.setattr(
+        "passat.providers.offline.datetime",
+        SimpleNamespace(now=lambda: fixed_now),
+    )
+
+    class ProviderSpy:
+        name = "test-provider"
+
+        def __init__(self):
+            self.calls = []
+
+        def generate_reply(self, message, _history, _system_instruction):
+            self.calls.append(message)
+            return "Provider nie powinien określać daty."
+
+    provider = ProviderSpy()
+    assistant = PassatAssistant(ProviderSelection(provider, "test-provider", False))
+    window = PassatWindow(assistant=assistant)
+    window.speech_output_service = ImmediateSpeechService()
+    window.show()
+
+    window._on_transcription("Passat, jaka jest dzisiaj data?")
+    for _ in range(100):
+        QTest.qWait(20)
+        if window.send_button.isEnabled() and "Dzisiaj jest środa" in window.chat.toPlainText():
+            break
+
+    assert "Dzisiaj jest środa, 28 października 2026 roku." in window.chat.toPlainText()
+    assert provider.calls == []
+    window.close()
+    assert window._thread_pool.waitForDone(1000)
+
+
+def test_route_rule_is_shared_by_typed_and_whisper_messages(qapp):
+    class ProviderSpy:
+        name = "test-provider"
+
+        def __init__(self):
+            self.calls = []
+
+        def generate_reply(self, message, _history, _system_instruction):
+            self.calls.append(message)
+            return "Provider nie powinien dostać tej wiadomości."
+
+    provider = ProviderSpy()
+    assistant = PassatAssistant(ProviderSelection(provider, "test-provider", False))
+    window = PassatWindow(assistant=assistant)
+    window.speech_output_service = ImmediateSpeechService()
+    window.show()
+
+    window.message_input.setText("Ustaw trasę na burdel.")
+    window.send_button.click()
+    for _ in range(100):
+        QTest.qWait(20)
+        if window.send_button.isEnabled() and window.chat.toPlainText().count("reguła lokalna") >= 1:
+            break
+
+    assert "Nie znam dokładnego adresu tego miejsca." in window.chat.toPlainText()
+    assert provider.calls == []
+
+    # _on_transcription jest wspólną ścieżką sygnału z Whispera i ręcznego mikrofonu.
+    window._on_transcription("Jak mam dojechać do burdelu?")
+    for _ in range(100):
+        QTest.qWait(20)
+        if window.send_button.isEnabled() and window.chat.toPlainText().count("reguła lokalna") >= 2:
+            break
+
+    assert window.chat.toPlainText().count("Nie znam dokładnego adresu tego miejsca.") == 2
+    assert provider.calls == []
     window.close()
     assert window._thread_pool.waitForDone(1000)
 

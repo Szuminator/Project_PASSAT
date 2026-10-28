@@ -1,4 +1,6 @@
 from collections.abc import Sequence
+from datetime import datetime
+from types import SimpleNamespace
 
 import pytest
 
@@ -32,6 +34,7 @@ def test_settings_come_from_environment(monkeypatch):
     monkeypatch.setenv("PASSAT_PIPER_MODEL", "voice/custom.onnx")
     monkeypatch.setenv("PASSAT_WAKE_WORD_ENABLED", "true")
     monkeypatch.setenv("PASSAT_WAKE_WORD_MODEL_PATH", "models/wake-test")
+    monkeypatch.setenv("PASSAT_WAKE_WORD_MIN_CONFIDENCE", "0.4")
     monkeypatch.setenv("PASSAT_VAD_SILENCE_SECONDS", "1.1")
     monkeypatch.setenv("PASSAT_VAD_RMS_THRESHOLD", "0.006")
     monkeypatch.setenv("PASSAT_VAD_PRE_ROLL_MS", "300")
@@ -47,6 +50,7 @@ def test_settings_come_from_environment(monkeypatch):
     assert settings.piper_model == "voice/custom.onnx"
     assert settings.wake_word_enabled is True
     assert settings.wake_word_model_path == "models/wake-test"
+    assert settings.wake_word_min_confidence == 0.4
     assert settings.vad_silence_seconds == 1.1
     assert settings.vad_rms_threshold == 0.006
     assert settings.vad_pre_roll_ms == 300
@@ -132,6 +136,89 @@ def test_local_time_question_skips_gemini_and_uses_local_clock():
     assert provider.calls == []
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Passat, jaka jest godzina?",
+        "Hej, która teraz godzina?",
+        "Która jest teraz godzina?",
+        "Podaj mi aktualną godzinę.",
+        "Masz godzinę?",
+        "Powiedz mi, która jest godzina.",
+        "Jaka jest lokalna godzina?",
+    ],
+)
+def test_common_current_time_phrasings_are_answered_locally(message):
+    provider = RecordingProvider()
+    assistant = PassatAssistant(ProviderSelection(provider, "test", False))
+
+    reply = assistant.handle_message(message)
+
+    assert reply.text.startswith("Jest teraz ")
+    assert reply.provider_name == "offline"
+    assert provider.calls == []
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Ile godzin trwa podróż?",
+        "Jaka jest godzina otwarcia sklepu?",
+        "Podaj godzinę spotkania.",
+        "Co oznacza słowo godzina?",
+    ],
+)
+def test_non_current_time_questions_are_not_answered_with_local_clock(message):
+    provider = RecordingProvider()
+    assistant = PassatAssistant(ProviderSelection(provider, "test", False))
+
+    reply = assistant.handle_message(message)
+
+    assert reply.provider_name == "test"
+    assert provider.calls[0][0] == message
+
+
+def test_current_date_is_formatted_in_polish_and_skips_provider(monkeypatch):
+    local_timezone = datetime.now().astimezone().tzinfo
+    fixed_now = datetime(2026, 10, 28, 12, 0, tzinfo=local_timezone)
+    monkeypatch.setattr(
+        "passat.providers.offline.datetime",
+        SimpleNamespace(now=lambda: fixed_now),
+    )
+    provider = RecordingProvider()
+    assistant = PassatAssistant(ProviderSelection(provider, "test", False))
+
+    for message in (
+        "Passat, jaka jest dzisiaj data?",
+        "Jaki mamy dzisiaj dzień?",
+        "Podaj dzisiejszą datę.",
+        "Która jest dzisiaj data?",
+    ):
+        reply = assistant.handle_message(message)
+        assert reply.text == "Dzisiaj jest środa, 28 października 2026 roku."
+        assert reply.provider_name == "offline"
+
+    assert provider.calls == []
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Jaka jest data spotkania?",
+        "Podaj datę premiery filmu.",
+        "Co wydarzyło się dzisiaj?",
+    ],
+)
+def test_non_current_date_questions_are_not_answered_with_system_date(message):
+    provider = RecordingProvider()
+    assistant = PassatAssistant(ProviderSelection(provider, "test", False))
+
+    reply = assistant.handle_message(message)
+
+    assert reply.provider_name == "test"
+    assert provider.calls[0][0] == message
+
+
 def test_empty_message_does_not_reach_provider():
     provider = RecordingProvider()
     assistant = PassatAssistant(ProviderSelection(provider, "test", False))
@@ -140,3 +227,57 @@ def test_empty_message_does_not_reach_provider():
         assistant.handle_message("   ")
 
     assert provider.calls == []
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Wyznacz trasę do najbliższego burdelu.",
+        "Wyznacz trasę do burdelu.",
+        "Ustaw nawigację na kurwy.",
+        "Jak dojechać do kurwiarni?",
+        "Jak mam dojechać do burdelu?",
+        "Chcę dojechać na kurwy.",
+        "Jak najłatwiej trafić do domu publicznego?",
+        "Potrzebuję trasy do burdelu.",
+        "Pokaż drogę do agencji towarzyskiej.",
+        "Zaplanuj trasę do domu publicznego.",
+        "Nawiguj na kury.",  # typowa pomyłka rozpoznawania „kurwy”
+        "Ustaw cel podróży: lupanar.",
+    ],
+)
+def test_route_easter_egg_is_deterministic_and_skips_provider(message):
+    provider = RecordingProvider()
+    assistant = PassatAssistant(ProviderSelection(provider, "test", False))
+
+    reply = assistant.handle_message(message)
+
+    assert reply.text == "Nie znam dokładnego adresu tego miejsca."
+    assert reply.provider_name == "reguła lokalna"
+    assert reply.is_local_rule is True
+    assert reply.is_offline is False
+    assert provider.calls == []
+    assert assistant.history == [
+        ChatMessage("user", message),
+        ChatMessage("assistant", reply.text),
+    ]
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Co oznacza słowo burdel?",
+        "Jak odmienić słowo kurwy?",
+        "Wyznacz trasę do Krakowa.",
+        "Wyznacz trasę do najbliższego hotelu.",
+        "Pokaż drogę do Warszawy i opowiedz, co znaczy burdel.",
+    ],
+)
+def test_route_easter_egg_ignores_word_meanings_and_other_destinations(message):
+    provider = RecordingProvider()
+    assistant = PassatAssistant(ProviderSelection(provider, "test", False))
+
+    reply = assistant.handle_message(message)
+
+    assert reply.is_local_rule is False
+    assert provider.calls[0][0] == message

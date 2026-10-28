@@ -159,7 +159,8 @@ połączenia dopiero po otrzymaniu pierwszej odpowiedzi.
 Jeśli nie ma klucza albo dostawca AI zwróci błąd, Passat przełącza pojedynczą
 wiadomość na prosty tryb offline i pokazuje informację o użytym dostawcy. Tryb
 offline rozpoznaje powitania, pytania o tożsamość Passata i tryb działania;
-potrafi też podać lokalną godzinę. Pozostałych odpowiedzi nie generuje model
+potrafi też podać lokalną godzinę i dzisiejszą datę po polsku. Wartości pobiera
+z zegara i strefy czasowej komputera. Pozostałych odpowiedzi nie generuje model
 językowy.
 
 ## Rozmowa głosowa (lokalna)
@@ -219,6 +220,7 @@ Ustawienia w `.env`:
 ```dotenv
 PASSAT_WAKE_WORD_ENABLED=true
 PASSAT_WAKE_WORD_MODEL_PATH=models/wake-word/vosk-model-small-pl-0.22
+PASSAT_WAKE_WORD_MIN_CONFIDENCE=0.0
 PASSAT_VAD_SILENCE_SECONDS=0.8
 PASSAT_VAD_RMS_THRESHOLD=0.004
 PASSAT_VAD_PRE_ROLL_MS=200
@@ -230,6 +232,18 @@ bufora początku. VAD używa energii krótkich ramek audio i adaptuje próg do t
 podczas oczekiwania na hasło. Głośne otoczenie lub bardzo cichy mikrofon mogą
 wymagać dostrojenia progu. Wartości spoza bezpiecznego zakresu są ograniczane,
 a błędny wpis wraca do wartości domyślnej.
+`PASSAT_WAKE_WORD_MIN_CONFIDENCE` pozwala ustawić minimalny confidence słowa
+z końcowego wyniku Vosk (zakres 0–1). Domyślne `0.0` wyłącza ten filtr, ponieważ
+wynik nie jest skalibrowanym prawdopodobieństwem; ustawienie wyższego progu
+wymaga sprawdzenia na poprawnych wywołaniach z różnych odległości. Jeśli próg
+jest aktywny, ale wynik nie zawiera confidence, detektor nie zaakceptuje tego
+wywołania. Wyniki częściowe nigdy same nie aktywują Passata.
+
+Detektor potwierdza hasło dopiero po końcowym wyniku Vosk i dopasowuje pełny
+token `passat`. Gramatyka uwzględnia też znane pomyłki (`pa`, `fasola`), żeby
+dekoder miał możliwość zwrócenia ich zamiast wymuszania nazwy Passata. To
+ogranicza fałszywe aktywacje, ale nie gwarantuje ich całkowitego wyeliminowania;
+sprawdź zachowanie na docelowym mikrofonie i w typowej odległości.
 
 Przycisk **WYŁĄCZ NASŁUCH HASŁA** zatrzymuje oczekiwanie; można je później
 włączyć ponownie. Jeżeli brakuje modelu, biblioteki lub mikrofonu, nasłuch się

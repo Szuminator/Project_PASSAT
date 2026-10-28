@@ -16,6 +16,7 @@ DEFAULT_PIPER_MODEL = "models/voices/pl_PL-gosia-medium.onnx"
 DEFAULT_VAD_SILENCE_SECONDS = 0.8
 DEFAULT_VAD_RMS_THRESHOLD = 0.004
 DEFAULT_VAD_PRE_ROLL_MS = 200
+DEFAULT_WAKE_WORD_MIN_CONFIDENCE = 0.0
 
 
 def _float_setting(name: str, default: float, minimum: float, maximum: float) -> float:
@@ -48,6 +49,7 @@ class Settings:
     piper_model: str = DEFAULT_PIPER_MODEL
     wake_word_enabled: bool = True
     wake_word_model_path: str = "models/wake-word/vosk-model-small-pl-0.22"
+    wake_word_min_confidence: float = DEFAULT_WAKE_WORD_MIN_CONFIDENCE
     vad_silence_seconds: float = DEFAULT_VAD_SILENCE_SECONDS
     vad_rms_threshold: float = DEFAULT_VAD_RMS_THRESHOLD
     vad_pre_roll_ms: int = DEFAULT_VAD_PRE_ROLL_MS
@@ -75,6 +77,12 @@ class Settings:
                 "models/wake-word/vosk-model-small-pl-0.22",
             ).strip()
             or "models/wake-word/vosk-model-small-pl-0.22",
+            wake_word_min_confidence=_float_setting(
+                "PASSAT_WAKE_WORD_MIN_CONFIDENCE",
+                DEFAULT_WAKE_WORD_MIN_CONFIDENCE,
+                0.0,
+                1.0,
+            ),
             vad_silence_seconds=_float_setting(
                 "PASSAT_VAD_SILENCE_SECONDS", DEFAULT_VAD_SILENCE_SECONDS, 0.2, 5.0
             ),

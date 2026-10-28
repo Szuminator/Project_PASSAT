@@ -21,8 +21,10 @@ class VoskWakeWordEngine:
     """Wykrywa polskie słowo „Passat” przez lokalny model Vosk."""
 
     SAMPLE_RATE = 16_000
+    WAKE_GRAMMAR = ["passat", "pa", "fasola", "[unk]"]
 
-    def __init__(self, model_path: str | Path):
+    def __init__(self, model_path: str | Path, minimum_confidence: float = 0.0):
+        self.minimum_confidence = min(1.0, max(0.0, minimum_confidence))
         path = Path(model_path)
         if not path.is_absolute():
             path = Path(__file__).resolve().parents[2] / path
@@ -52,8 +54,12 @@ class VoskWakeWordEngine:
         self._recognizer = self._recognizer_factory(
             self._model,
             self.SAMPLE_RATE,
-            json.dumps(["passat", "[unk]"], ensure_ascii=False),
+            json.dumps(self.WAKE_GRAMMAR, ensure_ascii=False),
         )
+        set_words = getattr(self._recognizer, "SetWords", None)
+        if callable(set_words):
+            # Wynik końcowy może zawierać confidence słów; nie każdy backend go zwróci.
+            set_words(True)
 
     def reset(self) -> None:
         self._reset_recognizer()
@@ -63,12 +69,40 @@ class VoskWakeWordEngine:
         words = re.findall(r"[\wąćęłńóśźż]+", text.casefold())
         return "passat" in words
 
+    def _confirmed_result_contains_wake_word(self, result: dict) -> bool:
+        """Sprawdza pełny wynik; próg confidence jest opcjonalny i domyślnie wyłączony."""
+        text = result.get("text", "")
+        if not isinstance(text, str) or not self._contains_wake_word(text):
+            return False
+        if self.minimum_confidence <= 0:
+            return True
+
+        word_results = result.get("result", [])
+        if not isinstance(word_results, list):
+            return False
+        scores = []
+        for word in word_results:
+            if not isinstance(word, dict) or not self._contains_wake_word(str(word.get("word", ""))):
+                continue
+            try:
+                score = float(word["conf"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if 0 <= score <= 1:
+                scores.append(score)
+        # Jawnie ustawiony próg wymaga confidence; bez niego nie da się go sprawdzić.
+        return bool(scores) and max(scores) >= self.minimum_confidence
+
     def detect(self, frame: bytes) -> bool:
-        if self._recognizer.AcceptWaveform(frame):
+        if not self._recognizer.AcceptWaveform(frame):
+            # PartialResult może się zmieniać, dlatego nie jest używany do aktywacji.
+            return False
+
+        try:
             result = json.loads(self._recognizer.Result())
-        else:
-            result = json.loads(self._recognizer.PartialResult())
-        return self._contains_wake_word(result.get("text", "") or result.get("partial", ""))
+        except (TypeError, json.JSONDecodeError):
+            return False
+        return isinstance(result, dict) and self._confirmed_result_contains_wake_word(result)
 
 
 class WakeWordSignals(QObject):

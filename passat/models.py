@@ -19,3 +19,4 @@ class AssistantReply:
     provider_name: str
     is_offline: bool
     warning: str | None = None
+    is_local_rule: bool = False

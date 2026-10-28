@@ -22,7 +22,7 @@ from passat.assistant import PassatAssistant
 from passat.audio.input import VoiceInputService, VoiceInputWorker
 from passat.audio.output import PiperSpeechService, SpeechOutputWorker
 from passat.audio.tts_text import prepare_tts_text
-from passat.audio.wake_word import WakeWordWorker
+from passat.audio.wake_word import VoskWakeWordEngine, WakeWordWorker
 from passat.models import AssistantReply
 from passat.providers.base import ProviderConfigurationError
 from passat.providers.factory import ProviderSelection, create_provider
@@ -293,7 +293,9 @@ class PassatWindow(QMainWindow):
             self.chat.appendPlainText(f"INFORMACJA: {reply.warning}")
 
         self._reply_is_offline = reply.is_offline
-        if reply.is_offline:
+        if reply.is_local_rule:
+            self.provider_label.setText("Odpowiedź lokalna · bez wywołania modelu")
+        elif reply.is_offline:
             self.provider_label.setText("Dostawca: OFFLINE · odpowiedzi podstawowe")
         else:
             self.provider_label.setText(
@@ -471,6 +473,9 @@ class PassatWindow(QMainWindow):
             self._wake_shutdown_event,
             self._wake_manual_record_event,
             self._voice_stop_event,
+            engine_factory=lambda path: VoskWakeWordEngine(
+                path, minimum_confidence=self.settings.wake_word_min_confidence
+            ),
             engine=self._wake_engine,
         )
         worker.signals.engine_ready.connect(self._on_wake_engine_ready)
