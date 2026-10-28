@@ -189,8 +189,9 @@ PASSAT_PIPER_MODEL=models/voices/pl_PL-gosia-medium.onnx
 
 Model Whisper ładuje się po pierwszej próbie transkrypcji i działa na CPU w
 trybie `int8`. Pierwsze użycie wymaga internetu, aby pobrać model; kolejne
-transkrypcje są lokalne. Wypowiedź można zakończyć przyciskiem **ZATRZYMAJ
-NAGRYWANIE**. Odpowiedzi są odczytywane po zakończeniu odpowiedzi AI;
+transkrypcje są lokalne. Nagrywanie kończy się automatycznie po wykryciu ciszy
+po mowie; przycisk **ZATRZYMAJ NAGRYWANIE** nadal pozwala zatrzymać je wcześniej.
+Odpowiedzi są odczytywane po zakończeniu odpowiedzi AI;
 **PRZERWIJ MÓWIENIE** zatrzymuje aktualne odtwarzanie. Jeśli Piper lub głos nie
 są dostępne, tekstowa odpowiedź nadal pojawia się w czacie.
 
@@ -199,9 +200,12 @@ są dostępne, tekstowa odpowiedź nadal pojawia się w czacie.
 Nasłuch hasła **Passat** jest domyślnie włączony i działa lokalnie przez Vosk.
 Audio nie jest wysyłane do chmury ani zapisywane na dysku. Do detekcji i
 nagrywania używany jest jeden strumień mikrofonu. Po rozpoznaniu hasła Passat
-przechodzi do stanu **SŁUCHAM**; nagranie kończy się dopiero po naciśnięciu
-**ZATRZYMAJ NAGRYWANIE**. Nasłuch jest wstrzymany podczas myślenia i odtwarzania
-odpowiedzi, aby Passat nie aktywował się od własnego głosu.
+przechodzi do stanu **SŁUCHAM**. Lokalne wykrywanie energii audio kończy nagranie
+po domyślnych 0,8 sekundy ciszy po rozpoczęciu mowy. Początkowa cisza nie kończy
+sesji; krótki bufor zachowuje fragment sprzed wykrycia początku wypowiedzi.
+Przycisk **ZATRZYMAJ NAGRYWANIE** pozostaje awaryjną opcją ręcznego zatrzymania.
+Nasłuch hasła jest wstrzymany podczas myślenia i odtwarzania odpowiedzi, aby
+Passat nie aktywował się od własnego głosu.
 
 Biblioteka Vosk jest instalowana z `requirements.txt`, ale model językowy pobierz
 ręcznie z [oficjalnego katalogu modeli Vosk](https://alphacephei.com/vosk/models).
@@ -215,7 +219,17 @@ Ustawienia w `.env`:
 ```dotenv
 PASSAT_WAKE_WORD_ENABLED=true
 PASSAT_WAKE_WORD_MODEL_PATH=models/wake-word/vosk-model-small-pl-0.22
+PASSAT_VAD_SILENCE_SECONDS=0.8
+PASSAT_VAD_RMS_THRESHOLD=0.004
+PASSAT_VAD_PRE_ROLL_MS=200
 ```
+
+`PASSAT_VAD_SILENCE_SECONDS` ustawia ciszę wymaganą do zakończenia nagrania.
+`PASSAT_VAD_RMS_THRESHOLD` reguluje czułość, a `PASSAT_VAD_PRE_ROLL_MS` długość
+bufora początku. VAD używa energii krótkich ramek audio i adaptuje próg do tła
+podczas oczekiwania na hasło. Głośne otoczenie lub bardzo cichy mikrofon mogą
+wymagać dostrojenia progu. Wartości spoza bezpiecznego zakresu są ograniczane,
+a błędny wpis wraca do wartości domyślnej.
 
 Przycisk **WYŁĄCZ NASŁUCH HASŁA** zatrzymuje oczekiwanie; można je później
 włączyć ponownie. Jeżeli brakuje modelu, biblioteki lub mikrofonu, nasłuch się

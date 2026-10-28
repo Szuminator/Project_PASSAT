@@ -32,6 +32,9 @@ def test_settings_come_from_environment(monkeypatch):
     monkeypatch.setenv("PASSAT_PIPER_MODEL", "voice/custom.onnx")
     monkeypatch.setenv("PASSAT_WAKE_WORD_ENABLED", "true")
     monkeypatch.setenv("PASSAT_WAKE_WORD_MODEL_PATH", "models/wake-test")
+    monkeypatch.setenv("PASSAT_VAD_SILENCE_SECONDS", "1.1")
+    monkeypatch.setenv("PASSAT_VAD_RMS_THRESHOLD", "0.006")
+    monkeypatch.setenv("PASSAT_VAD_PRE_ROLL_MS", "300")
 
     settings = Settings.from_env()
 
@@ -44,6 +47,9 @@ def test_settings_come_from_environment(monkeypatch):
     assert settings.piper_model == "voice/custom.onnx"
     assert settings.wake_word_enabled is True
     assert settings.wake_word_model_path == "models/wake-test"
+    assert settings.vad_silence_seconds == 1.1
+    assert settings.vad_rms_threshold == 0.006
+    assert settings.vad_pre_roll_ms == 300
 
 
 def test_offline_provider_handles_identity_mode_greeting_and_unknown():

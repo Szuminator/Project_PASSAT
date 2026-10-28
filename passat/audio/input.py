@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import threading
 import queue
+import threading
+from collections import deque
 from collections.abc import Callable
 
 from PySide6.QtCore import QObject, QRunnable, Signal, Slot
@@ -13,18 +14,120 @@ class SpeechInputError(Exception):
     """Czytelny błąd wejścia głosowego, bez surowych danych urządzenia."""
 
 
+class _VoiceActivityDetector:
+    """Lekki detektor energii mowy z krótkim buforem początku wypowiedzi."""
+
+    def __init__(
+        self,
+        sample_rate: int,
+        silence_seconds: float,
+        rms_threshold: float,
+        pre_roll_ms: int,
+        frame_samples: int,
+    ):
+        self.sample_rate = sample_rate
+        self.silence_samples_limit = max(1, int(sample_rate * silence_seconds))
+        self.rms_threshold = rms_threshold
+        self._noise_floor = min(rms_threshold / 4, 0.001)
+        self.frame_samples = max(1, frame_samples)
+        pre_roll_frames = max(0, round(pre_roll_ms / 1000 * sample_rate / self.frame_samples))
+        self._pre_roll: deque[bytes] = deque(maxlen=pre_roll_frames)
+        self.speech_started = False
+        self.silence_samples = 0
+
+    def observe_background(self, frame: bytes, np) -> None:
+        """Powoli dopasowuje próg do tła, gdy Passat tylko nasłuchuje hasła."""
+        samples = np.frombuffer(frame, dtype=np.int16)
+        if not samples.size:
+            return
+        normalized = samples.astype(np.float32) / 32768.0
+        rms = float(np.sqrt(np.mean(np.square(normalized))))
+        self._noise_floor = 0.98 * self._noise_floor + 0.02 * rms
+
+    def _threshold(self) -> float:
+        # Ograniczenie zapobiega nadmiernemu wzrostowi progu w głośnym otoczeniu.
+        return max(self.rms_threshold, min(self._noise_floor * 2.5, 0.08))
+
+    def prime(self, frame: bytes) -> None:
+        """Dodaje ramkę aktywującą do bufora, bez uznawania jej za komendę."""
+        self._pre_roll.append(frame)
+
+    def process(self, frame: bytes, np) -> tuple[list[bytes], bool]:
+        """Zwraca ramki do zachowania oraz informację o końcu wypowiedzi."""
+        samples = np.frombuffer(frame, dtype=np.int16)
+        if samples.size == 0:
+            return [], False
+        normalized = samples.astype(np.float32) / 32768.0
+        rms = float(np.sqrt(np.mean(np.square(normalized))))
+
+        if not self.speech_started:
+            self._pre_roll.append(frame)
+            if rms < self._threshold():
+                self._noise_floor = 0.98 * self._noise_floor + 0.02 * rms
+                return [], False
+            self.speech_started = True
+            return list(self._pre_roll) or [frame], False
+
+        if rms >= self._threshold():
+            self.silence_samples = 0
+        else:
+            self.silence_samples += samples.size
+        return [frame], self.silence_samples >= self.silence_samples_limit
+
+
 class VoiceInputService:
     """Nagrywa z domyślnego mikrofonu i leniwie wczytuje faster-whisper."""
 
     SAMPLE_RATE = 16_000
+    FRAME_SAMPLES = 1_600  # 100 ms audio, rozdzielczość licznika ciszy
     SILENCE_RMS_THRESHOLD = 0.004
 
-    def __init__(self, model_name: str = "small"):
+    def __init__(
+        self,
+        model_name: str = "small",
+        *,
+        vad_silence_seconds: float = 0.8,
+        vad_rms_threshold: float = SILENCE_RMS_THRESHOLD,
+        vad_pre_roll_ms: int = 200,
+    ):
         self.model_name = model_name
+        self.vad_silence_seconds = max(0.1, vad_silence_seconds)
+        self.vad_rms_threshold = max(0.0001, vad_rms_threshold)
+        self.vad_pre_roll_ms = max(0, vad_pre_roll_ms)
         self._model = None
 
+    def _new_vad(self, frame_samples: int) -> _VoiceActivityDetector:
+        return _VoiceActivityDetector(
+            self.SAMPLE_RATE,
+            self.vad_silence_seconds,
+            self.vad_rms_threshold,
+            self.vad_pre_roll_ms,
+            frame_samples,
+        )
+
+    def _collect_until_silence(self, audio_queue, stop_event, np, frame_samples: int):
+        """Collects speech and its silence tail from an already-open input stream."""
+        vad = self._new_vad(frame_samples)
+        chunks: list[bytes] = []
+        while True:
+            try:
+                frame = audio_queue.get(timeout=0.05)
+            except queue.Empty:
+                if stop_event.is_set():
+                    break
+                continue
+
+            frames_to_keep, silence_finished = vad.process(frame, np)
+            chunks.extend(frames_to_keep)
+            if silence_finished or stop_event.is_set():
+                break
+
+        if not vad.speech_started or not chunks:
+            raise SpeechInputError("Nie wykryłem mowy. Powiedz coś i spróbuj ponownie.")
+        return np.frombuffer(b"".join(chunks), dtype=np.int16).astype(np.float32) / 32768.0
+
     def record(self, stop_event: threading.Event) -> object:
-        """Nagrywa do zatrzymania przyciskiem; audio zostaje tylko w pamięci."""
+        """Nagrywa do ciszy po mowie; przycisk może zatrzymać nagranie wcześniej."""
         try:
             import numpy as np
             import sounddevice as sd
@@ -33,41 +136,40 @@ class VoiceInputService:
                 "Brakuje bibliotek audio. Zainstaluj zależności z requirements.txt."
             ) from error
 
-        chunks = []
+        audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=16)
         callback_error: list[str] = []
 
         def capture(indata, frames, time_info, status) -> None:
             del frames, time_info
             if status and "overflow" in str(status).lower():
                 callback_error.append("overflow")
-            chunks.append(indata.copy())
+            try:
+                audio_queue.put_nowait(bytes(indata))
+            except queue.Full:
+                callback_error.append("overflow")
 
         try:
             sd.query_devices(kind="input")
             with sd.InputStream(
                 samplerate=self.SAMPLE_RATE,
                 channels=1,
-                dtype="float32",
+                dtype="int16",
+                blocksize=self.FRAME_SAMPLES,
                 callback=capture,
             ):
-                while not stop_event.wait(0.1):
-                    pass
+                audio = self._collect_until_silence(
+                    audio_queue, stop_event, np, self.FRAME_SAMPLES
+                )
         except sd.PortAudioError as error:
             raise SpeechInputError(
                 "Nie można otworzyć mikrofonu. Sprawdź, czy jest podłączony i czy "
                 "Passat ma dostęp do mikrofonu w ustawieniach Windows."
             ) from error
+        except SpeechInputError:
+            raise
         except Exception as error:
             raise SpeechInputError("Wystąpił błąd podczas nagrywania z mikrofonu.") from error
 
-        if not chunks:
-            raise SpeechInputError("Nie zarejestrowano dźwięku. Spróbuj ponownie.")
-        audio = np.concatenate(chunks, axis=0).reshape(-1).astype(np.float32, copy=False)
-        if audio.size < self.SAMPLE_RATE // 4:
-            raise SpeechInputError("Nagranie jest za krótkie. Powiedz coś jeszcze raz.")
-        rms = float(np.sqrt(np.mean(np.square(audio))))
-        if rms < self.SILENCE_RMS_THRESHOLD:
-            raise SpeechInputError("Nie wykryłem mowy. Sprawdź mikrofon i spróbuj ponownie.")
         if callback_error:
             raise SpeechInputError("Nagranie zostało przerwane przez problem z buforem audio.")
         return audio
@@ -81,7 +183,7 @@ class VoiceInputService:
         on_activated: Callable[[], None],
         on_recording_started: Callable[[], None],
     ) -> object | None:
-        """Nasłuchuje lokalnie, a po aktywacji nagrywa do ręcznego zatrzymania.
+        """Nasłuchuje lokalnie, a po aktywacji kończy nagranie po ciszy.
 
         Jedno wejście audio obsługuje zarówno detekcję, jak i nagranie. Dzięki temu
         mikrofon nie jest otwierany przez dwa niezależne procesy.
@@ -98,8 +200,11 @@ class VoiceInputService:
 
         audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=8)
         callback_errors: list[str] = []
-        chunks: list[bytes] = []
         recording = False
+        frame_samples = self.FRAME_SAMPLES
+        vad: _VoiceActivityDetector | None = None
+        chunks: list[bytes] = []
+        background_vad = self._new_vad(frame_samples)
 
         def capture(indata, frames, time_info, status) -> None:
             del frames, time_info
@@ -116,7 +221,7 @@ class VoiceInputService:
                 samplerate=self.SAMPLE_RATE,
                 channels=1,
                 dtype="int16",
-                blocksize=4_000,
+                blocksize=frame_samples,
                 callback=capture,
             ):
                 while not shutdown_event.is_set():
@@ -127,6 +232,8 @@ class VoiceInputService:
                     if not recording and manual_record_event.is_set():
                         manual_record_event.clear()
                         recording = True
+                        vad = self._new_vad(frame_samples)
+                        vad._noise_floor = background_vad._noise_floor
                         on_recording_started()
 
                     try:
@@ -140,9 +247,19 @@ class VoiceInputService:
                         recording = True
                         on_activated()
                         on_recording_started()
+                        # Ramka aktywująca zawiera zwykle końcówkę słowa „Passat”.
+                        # VAD zaczyna od kolejnej ramki, ale nadal zachowuje ją jako pre-roll.
+                        vad = self._new_vad(frame_samples)
+                        vad._noise_floor = background_vad._noise_floor
+                        vad.prime(frame)
+                        continue
+                    if not recording:
+                        background_vad.observe_background(frame, np)
                     if recording:
-                        chunks.append(frame)
-                        if stop_recording_event.is_set():
+                        assert vad is not None
+                        frames_to_keep, silence_finished = vad.process(frame, np)
+                        chunks.extend(frames_to_keep)
+                        if silence_finished or stop_recording_event.is_set():
                             break
         except sd.PortAudioError as error:
             raise SpeechInputError(
@@ -162,16 +279,9 @@ class VoiceInputService:
             raise SpeechInputError(
                 "Nagranie zostało przerwane przez problem z buforem audio."
             )
-        if not chunks:
-            raise SpeechInputError("Nie zarejestrowano dźwięku. Spróbuj ponownie.")
-
-        audio = np.frombuffer(b"".join(chunks), dtype=np.int16).astype(np.float32) / 32768.0
-        if audio.size < self.SAMPLE_RATE // 4:
-            raise SpeechInputError("Nagranie jest za krótkie. Powiedz coś jeszcze raz.")
-        rms = float(np.sqrt(np.mean(np.square(audio))))
-        if rms < self.SILENCE_RMS_THRESHOLD:
-            raise SpeechInputError("Nie wykryłem mowy. Sprawdź mikrofon i spróbuj ponownie.")
-        return audio
+        if vad is None or not vad.speech_started or not chunks:
+            raise SpeechInputError("Nie wykryłem mowy. Powiedz coś i spróbuj ponownie.")
+        return np.frombuffer(b"".join(chunks), dtype=np.int16).astype(np.float32) / 32768.0
 
     def transcribe(self, audio: object) -> str:
         """Rozpoznaje polską wypowiedź; model ładuje się dopiero przy pierwszej próbie."""

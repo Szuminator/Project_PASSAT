@@ -1,12 +1,18 @@
 import threading
 import sys
+import queue
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from core_widget import CoreWidget
-from passat.audio.input import SpeechInputError, VoiceInputService, VoiceInputWorker
+from passat.audio.input import (
+    SpeechInputError,
+    VoiceInputService,
+    VoiceInputWorker,
+    _VoiceActivityDetector,
+)
 from passat.audio.output import (
     PiperSpeechService,
     SpeechOutputError,
@@ -23,6 +29,10 @@ def run_voice_worker(worker):
     worker.signals.finished.connect(lambda: finished.append(True))
     worker.run()
     return results, errors, finished
+
+
+def int16_frame(value, size=1_600):
+    return np.full(size, value, dtype=np.int16).tobytes()
 
 
 def test_voice_worker_transcribes_once_and_finishes():
@@ -116,12 +126,74 @@ def test_recorder_reports_missing_or_denied_microphone(monkeypatch):
         VoiceInputService().record(threading.Event())
 
 
-def test_wake_listener_uses_one_stream_and_waits_for_manual_stop(monkeypatch):
-    activated = threading.Event()
-    recording_started = threading.Event()
-    stop_recording = threading.Event()
+def test_recording_reports_missing_numpy_for_vad(monkeypatch):
+    monkeypatch.setitem(sys.modules, "numpy", None)
+    with pytest.raises(SpeechInputError, match="Brakuje bibliotek audio"):
+        VoiceInputService().record(threading.Event())
+
+
+def test_vad_waits_through_initial_silence_and_keeps_pre_roll():
+    vad = _VoiceActivityDetector(16_000, 0.8, 0.004, 200, 1_600)
+
+    for _ in range(5):
+        assert vad.process(int16_frame(0), np) == ([], False)
+    assert not vad.speech_started
+
+    kept, finished = vad.process(int16_frame(1_500), np)
+
+    assert vad.speech_started
+    assert not finished
+    assert len(kept) == 2
+    assert kept[-1] == int16_frame(1_500)
+
+
+def test_vad_ends_after_configured_silence_and_bridges_short_pause():
+    vad = _VoiceActivityDetector(16_000, 0.8, 0.004, 200, 1_600)
+    assert vad.process(int16_frame(2_000), np)[1] is False
+
+    for _ in range(4):  # 0,4 s przerwy nie kończy zdania
+        assert vad.process(int16_frame(0), np)[1] is False
+    assert vad.process(int16_frame(2_000), np)[1] is False
+
+    for _ in range(7):
+        assert vad.process(int16_frame(0), np)[1] is False
+    assert vad.process(int16_frame(0), np)[1] is True
+
+
+def test_vad_accepts_very_short_and_long_utterances():
+    short_vad = _VoiceActivityDetector(16_000, 0.2, 0.004, 100, 1_600)
+    short_audio, _ = short_vad.process(int16_frame(2_000), np)
+    assert short_vad.speech_started
+    assert len(short_audio) == 1
+    assert short_vad.process(int16_frame(0), np)[1] is False
+    assert short_vad.process(int16_frame(0), np)[1] is True
+
+    long_vad = _VoiceActivityDetector(16_000, 0.8, 0.004, 200, 1_600)
+    for _ in range(100):
+        _, finished = long_vad.process(int16_frame(2_000), np)
+        assert not finished
+    for _ in range(7):
+        assert long_vad.process(int16_frame(0), np)[1] is False
+    assert long_vad.process(int16_frame(0), np)[1] is True
+
+
+def test_manual_stop_returns_audio_without_waiting_for_silence():
+    service = VoiceInputService()
+    audio_queue = queue.Queue()
+    audio_queue.put(int16_frame(2_000))
+    stop_event = threading.Event()
+    stop_event.set()
+
+    audio = service._collect_until_silence(audio_queue, stop_event, np, 1_600)
+
+    assert audio.size == 1_600
+    assert float(np.max(audio)) > 0
+
+
+def test_manual_microphone_recording_also_ends_after_silence(monkeypatch):
+    voice = np.full((1_600, 1), 2_000, dtype=np.int16)
+    silence = np.zeros((1_600, 1), dtype=np.int16)
     stream_count = []
-    frame = np.full((4_000, 1), 5_000, dtype=np.int16)
 
     class FakeStream:
         def __init__(self, **kwargs):
@@ -129,7 +201,45 @@ def test_wake_listener_uses_one_stream_and_waits_for_manual_stop(monkeypatch):
             stream_count.append(True)
 
         def __enter__(self):
-            self.callback(frame, len(frame), None, None)
+            for frame in [silence, voice, voice] + [silence] * 9:
+                self.callback(frame, len(frame), None, None)
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sounddevice",
+        SimpleNamespace(
+            PortAudioError=type("FakePortAudioError", (Exception,), {}),
+            query_devices=lambda **_kwargs: None,
+            InputStream=FakeStream,
+        ),
+    )
+
+    audio = VoiceInputService().record(threading.Event())
+
+    assert stream_count == [True]
+    assert audio.size >= 1_600 * 9
+
+
+def test_wake_listener_uses_one_stream_and_waits_for_manual_stop(monkeypatch):
+    activated = threading.Event()
+    recording_started = threading.Event()
+    stop_recording = threading.Event()
+    stream_count = []
+    wake_frame = np.full((1_600, 1), 5_000, dtype=np.int16)
+    voice_frame = np.full((1_600, 1), 6_000, dtype=np.int16)
+
+    class FakeStream:
+        def __init__(self, **kwargs):
+            self.callback = kwargs["callback"]
+            stream_count.append(True)
+
+        def __enter__(self):
+            self.callback(wake_frame, len(wake_frame), None, None)
+            self.callback(voice_frame, len(voice_frame), None, None)
             return self
 
         def __exit__(self, *_args):
@@ -178,7 +288,64 @@ def test_wake_listener_uses_one_stream_and_waits_for_manual_stop(monkeypatch):
 
     assert not worker.is_alive()
     assert errors == []
-    assert result[0].shape == (4_000,)
+    assert result[0].shape == (3_200,)
+
+
+def test_wake_listener_stops_after_silence_without_opening_second_stream(monkeypatch):
+    wake = np.full((1_600, 1), 6_000, dtype=np.int16)
+    speech = np.full((1_600, 1), 5_000, dtype=np.int16)
+    silence = np.zeros((1_600, 1), dtype=np.int16)
+    stream_count = []
+    producer_threads = []
+
+    class FakeStream:
+        def __init__(self, **kwargs):
+            self.callback = kwargs["callback"]
+            stream_count.append(True)
+
+        def __enter__(self):
+            frames = [silence] * 3 + [wake, speech, speech] + [silence] * 9
+
+            def produce():
+                for frame in frames:
+                    self.callback(frame, len(frame), None, None)
+                    threading.Event().wait(0.003)
+
+            thread = threading.Thread(target=produce)
+            thread.start()
+            producer_threads.append(thread)
+            return self
+
+        def __exit__(self, *_args):
+            producer_threads[0].join(timeout=1)
+            return False
+
+    fake_sounddevice = SimpleNamespace(
+        PortAudioError=type("FakePortAudioError", (Exception,), {}),
+        query_devices=lambda **_kwargs: None,
+        InputStream=FakeStream,
+    )
+    monkeypatch.setitem(sys.modules, "sounddevice", fake_sounddevice)
+
+    class Detector:
+        def detect(self, frame):
+            return frame == wake.tobytes()
+
+    activated = []
+    recording_started = []
+    audio = VoiceInputService().listen_for_wake_word_and_record(
+        Detector(),
+        threading.Event(),
+        threading.Event(),
+        threading.Event(),
+        lambda: activated.append(True),
+        lambda: recording_started.append(True),
+    )
+
+    assert len(stream_count) == 1
+    assert activated == [True]
+    assert recording_started == [True]
+    assert audio.size >= 1_600 * 9
 
 
 def test_wake_listener_reports_microphone_error(monkeypatch):

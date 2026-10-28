@@ -1,6 +1,7 @@
 """Odczyt ustawień Passata ze zmiennych środowiskowych i pliku .env."""
 
 import os
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,6 +13,28 @@ DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
 DEFAULT_GROQ_MODEL = "qwen/qwen3.8-27b"
 DEFAULT_STT_MODEL = "small"
 DEFAULT_PIPER_MODEL = "models/voices/pl_PL-gosia-medium.onnx"
+DEFAULT_VAD_SILENCE_SECONDS = 0.8
+DEFAULT_VAD_RMS_THRESHOLD = 0.004
+DEFAULT_VAD_PRE_ROLL_MS = 200
+
+
+def _float_setting(name: str, default: float, minimum: float, maximum: float) -> float:
+    """Czyta i ogranicza wartość liczbową, aby błędny .env nie zatrzymał GUI."""
+    try:
+        value = float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    if not math.isfinite(value):
+        return default
+    return min(max(value, minimum), maximum)
+
+
+def _int_setting(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return min(max(value, minimum), maximum)
 
 
 @dataclass(frozen=True)
@@ -25,6 +48,9 @@ class Settings:
     piper_model: str = DEFAULT_PIPER_MODEL
     wake_word_enabled: bool = True
     wake_word_model_path: str = "models/wake-word/vosk-model-small-pl-0.22"
+    vad_silence_seconds: float = DEFAULT_VAD_SILENCE_SECONDS
+    vad_rms_threshold: float = DEFAULT_VAD_RMS_THRESHOLD
+    vad_pre_roll_ms: int = DEFAULT_VAD_PRE_ROLL_MS
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -49,4 +75,11 @@ class Settings:
                 "models/wake-word/vosk-model-small-pl-0.22",
             ).strip()
             or "models/wake-word/vosk-model-small-pl-0.22",
+            vad_silence_seconds=_float_setting(
+                "PASSAT_VAD_SILENCE_SECONDS", DEFAULT_VAD_SILENCE_SECONDS, 0.2, 5.0
+            ),
+            vad_rms_threshold=_float_setting(
+                "PASSAT_VAD_RMS_THRESHOLD", DEFAULT_VAD_RMS_THRESHOLD, 0.0001, 0.1
+            ),
+            vad_pre_roll_ms=_int_setting("PASSAT_VAD_PRE_ROLL_MS", DEFAULT_VAD_PRE_ROLL_MS, 0, 1000),
         )

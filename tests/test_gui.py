@@ -13,6 +13,19 @@ class ImmediateSpeechService:
         return False
 
 
+class ControlledSpeechServiceForWakeTest:
+    def __init__(self):
+        self.started = Event()
+
+    def speak(self, _text, stop_event, on_started, on_audio_level):
+        on_started()
+        on_audio_level(0.4)
+        self.started.set()
+        stop_event.wait(timeout=2)
+        on_audio_level(0.0)
+        return stop_event.is_set()
+
+
 class BlockingAssistant:
     is_offline = False
     startup_notice = None
@@ -222,6 +235,45 @@ def test_speaking_status_follows_playback_and_stop_restores_ready(qapp):
 
     assert window.status_label.text().endswith("GOTOWY")
     assert window.core._audio_level == 0.0
+    window.close()
+    assert window._thread_pool.waitForDone(1000)
+
+
+def test_wake_listener_resumes_only_after_piper_finishes(qapp, monkeypatch):
+    class ImmediateAssistant:
+        is_offline = False
+        provider_name = "GroqCloud"
+        startup_notice = None
+
+        def handle_message(self, _message):
+            return AssistantReply("Odpowiedź do odczytania.", "GroqCloud", False)
+
+    speech_service = ControlledSpeechServiceForWakeTest()
+    window = PassatWindow(assistant=ImmediateAssistant())
+    window.speech_output_service = speech_service
+    window._wake_enabled = True
+    wake_starts = []
+    monkeypatch.setattr(window, "_start_wake_word_listener", lambda: wake_starts.append(True))
+    window.show()
+    window.message_input.setText("test odpowiedzi głosowej")
+    window.send_button.click()
+
+    for _ in range(100):
+        QTest.qWait(20)
+        if speech_service.started.is_set() and window.status_label.text().endswith("MÓWIĘ"):
+            break
+    assert speech_service.started.is_set()
+    assert window.status_label.text().endswith("MÓWIĘ")
+    assert wake_starts == []
+
+    window.stop_speech_button.click()
+    for _ in range(100):
+        QTest.qWait(20)
+        if window.send_button.isEnabled():
+            break
+
+    assert wake_starts == [True]
+    window._wake_enabled = False
     window.close()
     assert window._thread_pool.waitForDone(1000)
 

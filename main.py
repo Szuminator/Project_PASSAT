@@ -76,7 +76,12 @@ class PassatWindow(QMainWindow):
         super().__init__()
         self.assistant = assistant or create_assistant()
         self.settings = Settings.from_env()
-        self.voice_input_service = VoiceInputService(self.settings.stt_model)
+        self.voice_input_service = VoiceInputService(
+            self.settings.stt_model,
+            vad_silence_seconds=self.settings.vad_silence_seconds,
+            vad_rms_threshold=self.settings.vad_rms_threshold,
+            vad_pre_roll_ms=self.settings.vad_pre_roll_ms,
+        )
         self.speech_output_service = PiperSpeechService(self.settings.piper_model)
         self._thread_pool = QThreadPool(self)
         self._active_worker: ReplyWorker | None = None
